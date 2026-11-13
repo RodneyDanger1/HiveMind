@@ -90,7 +90,7 @@ export function HiveField({ center = true }: { center?: boolean }) {
           <pattern id="hivefield-honeycomb" width="48" height="84" patternUnits="userSpaceOnUse">
             <path
               d="M12 0L36 0L48 21L36 42L12 42L0 21Z"
-              fill="none"
+              fill="var(--color-honey-200)"
               stroke="var(--color-honey-300)"
               strokeWidth="1.1"
               opacity="0.42"
@@ -138,6 +138,40 @@ export function HiveField({ center = true }: { center?: boolean }) {
             <stop offset="0%" stopColor="var(--color-honey-100)" stopOpacity="0.85" />
             <stop offset="100%" stopColor="var(--color-honey-100)" stopOpacity="0" />
           </radialGradient>
+          {/* Wax-cell texture stamped inside each lobe; reads as comb, not noise. */}
+          <pattern id="hivefield-comb-texture" width="26" height="45" patternUnits="userSpaceOnUse">
+            <path
+              d="M7 0h12l6 11-6 11H7L1 11Z"
+              fill="none"
+              stroke="var(--color-honey-800)"
+              strokeWidth="0.9"
+            />
+            <path
+              d="M-6 22h12l6 11-6 11H-6L-12 33Z"
+              fill="none"
+              stroke="var(--color-honey-800)"
+              strokeWidth="0.9"
+            />
+          </pattern>
+          {/* Paper vignette: the comb field fades before it reaches the frame. */}
+          <radialGradient id="hivefield-vignette" cx="50%" cy="50%" r="72%">
+            <stop offset="0%" stopColor="var(--color-canvas)" stopOpacity="0" />
+            <stop offset="68%" stopColor="var(--color-canvas)" stopOpacity="0" />
+            <stop offset="88%" stopColor="var(--color-canvas)" stopOpacity="0.45" />
+            <stop offset="100%" stopColor="var(--color-canvas)" stopOpacity="0.9" />
+          </radialGradient>
+          {/* Entrance tunnel: ink depth with a warm honey lip at the rim. */}
+          <radialGradient id="hivefield-tunnel" cx="50%" cy="76%" r="74%">
+            <stop offset="0%" stopColor="var(--color-ink-900)" />
+            <stop offset="78%" stopColor="var(--color-ink-900)" />
+            <stop offset="100%" stopColor="var(--color-honey-800)" />
+          </radialGradient>
+          {/* Landing board: honey planks catching light from above. */}
+          <linearGradient id="hivefield-board" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--color-honey-500)" />
+            <stop offset="55%" stopColor="var(--color-honey-600)" />
+            <stop offset="100%" stopColor="var(--color-honey-700)" />
+          </linearGradient>
           {/* Very subtle warm drop shadow: a gradient, never a filter. */}
           <radialGradient id="hivefield-shadow" cx="50%" cy="50%" r="50%">
             <stop offset="0%" stopColor="var(--color-honey-800)" stopOpacity="0.18" />
@@ -150,6 +184,7 @@ export function HiveField({ center = true }: { center?: boolean }) {
               <g key={cy}>
                 <ellipse cx="310" cy={cy + 14} rx="274" ry="111" fill="url(#hivefield-shadow)" />
                 <ellipse cx="310" cy={cy} rx="270" ry="108" fill="url(#hivefield-lobe)" />
+                <ellipse cx="310" cy={cy} rx="264" ry="103" fill="url(#hivefield-comb-texture)" opacity="0.13" />
                 <ellipse cx="310" cy={cy} rx="270" ry="108" fill="url(#hivefield-rim)" />
                 <ellipse
                   cx="310"
@@ -161,19 +196,55 @@ export function HiveField({ center = true }: { center?: boolean }) {
                 <ellipse cx="310" cy={cy - 44} rx="104" ry="24" fill="url(#hivefield-spec)" />
               </g>
             ))}
-            {/* The hive entrance: a dark arch and landing board at the base. */}
+            {/* The hive entrance: a recessed arch, a lit tunnel and a planked
+                landing board with three wax cells, at the base of the stack. */}
             <g className="hive-entrance">
-              <ellipse cx="310" cy="604" rx="92" ry="15" fill="var(--color-honey-800)" opacity="0.22" />
-              <path d="M244 606 Q244 548 310 548 Q376 548 376 606 Z" fill="var(--color-ink-900)" opacity="0.9" />
-              <path d="M260 604 Q260 564 310 564 Q360 564 360 604 Z" fill="var(--color-ink-900)" />
-              <ellipse className="hive-entrance-glow" cx="310" cy="580" rx="24" ry="12" fill="var(--color-honey-300)" opacity="0.28" />
-              <circle cx="310" cy="574" r="4" fill="var(--color-honey-200)" />
-              <path d="M232 608 H388" stroke="var(--color-honey-700)" strokeWidth="6" strokeLinecap="round" />
+              <ellipse cx="310" cy="618" rx="116" ry="18" fill="url(#hivefield-shadow)" />
+              <path d="M236 606 Q236 532 310 532 Q384 532 384 606 Z" fill="url(#hivefield-tunnel)" />
+              <path
+                d="M236 606 Q236 532 310 532 Q384 532 384 606"
+                fill="none"
+                stroke="var(--color-honey-700)"
+                strokeWidth="2.4"
+                opacity="0.5"
+              />
+              <path d="M252 606 Q252 550 310 550 Q368 550 368 606 Z" fill="var(--color-ink-900)" opacity="0.92" />
+              <path d="M264 606 Q264 566 310 566 Q356 566 356 606 Z" fill="var(--color-ink-900)" />
+              <ellipse
+                className="hive-entrance-glow"
+                cx="310"
+                cy="584"
+                rx="27"
+                ry="13"
+                fill="var(--color-honey-300)"
+                opacity="0.3"
+              />
+              <circle cx="310" cy="578" r="4.5" fill="var(--color-honey-200)" />
+              <circle
+                cx="310"
+                cy="578"
+                r="9"
+                fill="none"
+                stroke="var(--color-honey-300)"
+                strokeWidth="1"
+                opacity="0.35"
+              />
+              <path
+                d="M226 606H394Q400 606 400 612V618Q400 624 394 624H226Q220 624 220 618V612Q220 606 226 606Z"
+                fill="url(#hivefield-board)"
+                stroke="var(--color-honey-700)"
+                strokeWidth="1.2"
+              />
+              <path d="M236 614h148M248 619h124" stroke="var(--color-honey-700)" strokeWidth="1" opacity="0.35" />
+              <polygon points="292,609 298,612.5 298,617.5 292,621 286,617.5 286,612.5" fill="var(--color-honey-300)" opacity="0.7" />
+              <polygon points="310,609 316,612.5 316,617.5 310,621 304,617.5 304,612.5" fill="var(--color-honey-300)" opacity="0.85" />
+              <polygon points="328,609 334,612.5 334,617.5 328,621 322,617.5 322,612.5" fill="var(--color-honey-300)" opacity="0.7" />
             </g>
           </symbol>
         </defs>
 
         <rect width="100%" height="100%" fill="url(#hivefield-honeycomb)" opacity="0.95" />
+        <rect width="100%" height="100%" fill="url(#hivefield-vignette)" />
         {reduced ? null : (
           <rect
             key={rippleCycle}

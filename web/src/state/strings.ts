@@ -406,6 +406,54 @@ export const STRINGS = {
         'The work was stopped honestly. Start a smaller run or raise the documented call budget; do not retry blindly.',
       retryable: false,
     },
+    E_TOKEN_BUDGET_EXCEEDED: {
+      message: 'The run reached its combined token budget before the next model call.',
+      howToFix:
+        'The work was stopped honestly with no partial reply. Start a smaller run, or raise the documented run token budget; the cap is a hard safety limit, not a model error.',
+      retryable: false,
+    },
+    E_BUDGET_EXCEEDED: {
+      message: 'The run reached its cost budget.',
+      howToFix:
+        'The work was stopped honestly. Start a smaller run or raise the documented run cost cap; do not retry blindly.',
+      retryable: false,
+    },
+    E_APPROVAL_TIMEOUT: {
+      message: 'The approval request expired before a decision was recorded.',
+      howToFix:
+        'No side effect was performed. Start the request again and approve or deny within the approval window.',
+      retryable: true,
+    },
+    E_APPROVAL_NOT_FOUND: {
+      message: 'That approval request no longer exists.',
+      howToFix: 'Refresh the approval list; the request may have expired or been consumed.',
+      retryable: false,
+    },
+    E_TOOL_NOT_ALLOWED: {
+      message: 'That tool is not available to this agent tier.',
+      howToFix: 'Use a tool from the tier capability list, or let the parent agent perform the call.',
+      retryable: false,
+    },
+    E_TOOL_SCHEMA: {
+      message: 'The tool arguments did not match the tool schema.',
+      howToFix: 'Call the tool again with the documented required fields and no unknown fields.',
+      retryable: true,
+    },
+    E_SPAWN_DEPTH: {
+      message: 'That spawn would exceed the maximum hierarchy depth.',
+      howToFix: 'Let the current agent do the work directly, or spawn from a shallower parent.',
+      retryable: false,
+    },
+    E_FANOUT_LIMIT: {
+      message: 'That parent already has the maximum number of children.',
+      howToFix: 'Reuse an existing child or reduce the plan fan-out.',
+      retryable: false,
+    },
+    E_AGENT_LIMIT: {
+      message: 'The run reached its total agent cap.',
+      howToFix: 'Reduce the plan size or continue in a new run.',
+      retryable: false,
+    },
     E_LLM_RATE_LIMIT: {
       message: 'The provider rate limit was hit (HTTP 429).',
       howToFix:
@@ -472,11 +520,6 @@ export const STRINGS = {
     E_RUN_TERMINAL: {
       message: 'The run is already terminal.',
       howToFix: 'Submit a new prompt; completed/cancelled/killed runs cannot be mutated.',
-      retryable: false,
-    },
-    E_APPROVAL_NOT_FOUND: {
-      message: 'The approval request is no longer pending.',
-      howToFix: 'Refresh the approval overlay; it may have timed out or been resolved elsewhere.',
       retryable: false,
     },
     E_RUN_ACTIVE: {

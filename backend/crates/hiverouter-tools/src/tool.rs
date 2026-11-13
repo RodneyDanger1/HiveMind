@@ -229,15 +229,57 @@ impl ToolContract {
 
     /// Validates tool arguments against this contract's JSON Schema.
     ///
+    /// The refusal names the tool, the first violation path, and the accepted
+    /// argument shape (field names only, never the caller's values), so a model
+    /// that emitted malformed arguments can correct itself on the next turn
+    /// without the harness echoing a file body into an error string.
+    ///
     /// # Errors
     /// [`Refusal::ToolSchema`] with the first validation error path.
     pub fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         jsonschema::validate(&self.schema, args).map_err(|error| {
             ToolError::new(
                 Refusal::ToolSchema,
-                format!("arguments do not match the {} schema: {error}", self.id.id()),
+                format!(
+                    "arguments do not match the {} schema: {error} ({})",
+                    self.id.id(),
+                    self.accepted_shape_hint()
+                ),
             )
         })
+    }
+
+    /// Bounded, secret-free description of the accepted argument shape.
+    ///
+    /// Derived from the contract schema: field names and required fields only.
+    /// Values are deliberately never rendered, because a validated argument can
+    /// carry a file body (`file_write.content`) or a patch.
+    #[must_use]
+    pub fn accepted_shape_hint(&self) -> String {
+        let Some(object) = self.schema.as_object() else {
+            return "accepted shape unavailable".to_owned();
+        };
+        let mut fields: Vec<&str> = object
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| properties.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        let required: Vec<&str> = object
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!(
+            "accepted fields: [{}]; required: [{}]",
+            fields.join(", "),
+            required.join(", ")
+        )
     }
 }
 
@@ -329,10 +371,12 @@ pub struct WebFetchArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessDiagnoseArgs {
-    /// Diagnostic scope.
+    /// Diagnostic scope: `all`, `health`, `workspace`, `logs`, or `refusals`.
+    /// An unknown scope is a named `E_SCHEMA_INVALID` refusal, never a silent
+    /// default.
     #[serde(default = "default_diagnose_scope")]
     pub scope: String,
-    /// Maximum recent refusal rows (1..=50).
+    /// Maximum recent refusal rows (values are clamped to 1..=50).
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -612,13 +656,17 @@ impl ToolRegistry {
             ),
             contract(
                 ToolId::FileRead,
-                "Read a file inside the workspace jail.",
+                "Read a file inside the workspace jail. Paths are workspace-relative: \
+                 a leading '/', a drive letter, or '..' is refused. Use fs_glob or file_list \
+                 first when the exact path is unknown; a directory is not a file and must be \
+                 listed instead.",
                 PermissionClass::Read,
                 schema_of!(FileReadArgs),
             ),
             contract(
                 ToolId::FileList,
-                "List a directory inside the workspace jail.",
+                "List a directory inside the workspace jail. Paths are workspace-relative; \
+                 the root is the default. Use this to discover a path before file_read.",
                 PermissionClass::Read,
                 schema_of!(FileListArgs),
             ),
@@ -716,7 +764,8 @@ impl ToolRegistry {
             ),
             contract(
                 ToolId::HarnessDiagnose,
-                "Read this harness's own health, log metadata, and recent refusal summary. Read-only; returns no secrets or raw log bodies.",
+                "Read this harness's own health, workspace path diagnostics, log metadata, \
+                 and recent refusal summary. Read-only; returns no secrets or raw log bodies.",
                 PermissionClass::Read,
                 schema_of!(HarnessDiagnoseArgs),
             ),
@@ -812,6 +861,7 @@ impl ToolRegistry {
                 ToolId::GitStatus,
                 ToolId::GitDiff,
                 ToolId::GitLog,
+                ToolId::HarnessDiagnose,
             ],
         );
         allowlists.insert(
@@ -1072,6 +1122,44 @@ mod tests {
             for id in registry.allowlist(tier) {
                 assert!(ToolId::from_id(id.id()).is_some());
             }
+        }
+    }
+
+    #[test]
+    fn malformed_args_name_the_accepted_shape_without_echoing_values() {
+        let registry = ToolRegistry::standard();
+        let contract = registry.contract(ToolId::FileRead).expect("file_read");
+        assert_eq!(
+            contract.accepted_shape_hint(),
+            "accepted fields: [path]; required: [path]"
+        );
+
+        let secret = "TOP-SECRET-FILE-BODY";
+        let error = contract
+            .validate_args(&serde_json::json!({"path": "a", "content": secret}))
+            .expect_err("unknown field");
+        assert_eq!(error.code(), "E_TOOL_SCHEMA");
+        let detail = error.detail();
+        assert!(detail.contains("accepted fields: [path]"), "{detail}");
+        assert!(detail.contains("required: [path]"), "{detail}");
+        assert!(
+            !detail.contains(secret),
+            "a rejected argument value must never be echoed into the refusal: {detail}"
+        );
+    }
+
+    #[test]
+    fn argument_values_are_absent_from_every_contract_shape_hint() {
+        let registry = ToolRegistry::standard();
+        for id in ToolId::all() {
+            let hint = registry
+                .contract(id)
+                .expect("contract")
+                .accepted_shape_hint();
+            assert!(hint.is_empty() || hint.starts_with("accepted fields: ["), "{id:?}: {hint}");
+            // Only field/required names are rendered: no JSON value punctuation
+            // that would indicate a caller-supplied value leaked in.
+            assert!(!hint.contains('"'), "{id:?} hint carried a value: {hint}");
         }
     }
 }

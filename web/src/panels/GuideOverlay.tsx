@@ -30,6 +30,37 @@ const STEPS = [
   'Open Agents for todos, jobs, memory, and the roster; Data for runs; History to replay.',
 ];
 
+/** Small shape grammar per node kind, drawn inside the honeycomb swatch. */
+function GuideGlyph({ name }: { readonly name: string }) {
+  const stroke = { fill: 'none', stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
+  return (
+    <svg className="guide-swatch-glyph" width="10" height="10" viewBox="0 0 12 12" aria-hidden="true" focusable="false">
+      {name === 'HYPER' ? (
+        <>
+          <polygon points="6,1 10.5,3.5 10.5,8.5 6,11 1.5,8.5 1.5,3.5" {...stroke} />
+          <polygon points="6,4 8,5.1 8,7.4 6,8.5 4,7.4 4,5.1" {...stroke} strokeWidth={1} />
+        </>
+      ) : null}
+      {name === 'SUPER' ? (
+        <>
+          <polygon points="6,1.2 10.2,3.6 10.2,8.4 6,10.8 1.8,8.4 1.8,3.6" {...stroke} />
+          <path d="M6 5.4v3" {...stroke} strokeWidth={1.2} />
+        </>
+      ) : null}
+      {name === 'WORKER' ? <circle cx="6" cy="6" r="2.6" fill="currentColor" /> : null}
+      {name === 'SUB' ? <circle cx="6" cy="6" r="3.4" {...stroke} /> : null}
+      {name === 'TOOL' ? <path d="M3.2 3.4 6.6 6l-3.4 2.6M7.4 9h2.4" {...stroke} /> : null}
+      {name === 'BEE ROUTE' ? (
+        <>
+          <ellipse cx="6" cy="6.6" rx="3.2" ry="2" fill="currentColor" />
+          <path d="M6.6 4.8v3.6M4.6 4.9v3.4" stroke="var(--color-honey-200)" strokeWidth="0.9" />
+          <path d="M4.4 4.4C3.4 3 2.4 2.8 1.7 3.3M7.2 4.3c1-1.3 2-1.5 2.7-1" {...stroke} strokeWidth={0.9} />
+        </>
+      ) : null}
+    </svg>
+  );
+}
+
 /** True when either the OS preference or the in-app switch asks for stillness. */
 function motionOff(): boolean {
   return (
@@ -157,6 +188,7 @@ export function GuideOverlay({ open, onClose }: { open: boolean; onClose: () => 
                 <div className="flex items-center gap-2">
                   <span className="guide-swatch" aria-hidden="true">
                     <span className={`guide-swatch-fill ${node.tone}`} />
+                    <GuideGlyph name={node.name} />
                   </span>
                   <span className="hm-eyebrow text-ink-800">{node.name}</span>
                 </div>
@@ -165,6 +197,12 @@ export function GuideOverlay({ open, onClose }: { open: boolean; onClose: () => 
             ))}
           </div>
         </section>
+
+        <div className="guide-divider" aria-hidden="true">
+          {[0, 1, 2, 3].map((cell) => (
+            <span key={cell} />
+          ))}
+        </div>
 
         <section className="guide-section">
           <h3 className="hm-section-title">Permissions</h3>

@@ -15,16 +15,31 @@
 //! Mechanical contract:
 //! - the program must be on the explicit allowlist (by bare executable name);
 //!   paths with separators are refused so a call cannot re-point the allowlist;
+//! - each allowlisted program carries a [`CommandSpec`] that bounds its argument
+//!   count, refuses arguments that re-point the executable, and may require a
+//!   fixed leading token (see [`ShellPolicy::conservative_default`]);
 //! - command-interpreter hosts ([`SHELL_INTERPRETER_HOSTS`]) are refused even
 //!   when a policy lists them;
 //! - argument escape forms (`/c`, `/k`, `&`, `|`, `>`, CR/LF) are refused
-//!   before any grant is consumed or any child is spawned;
+//!   before any child is spawned;
 //! - no shell interpolation: arguments are passed directly to the program;
-//! - working directory is resolved through [`WorkspaceJail`];
-//! - stdout/stderr are capped; the child is bounded by a timeout and killed
-//!   through a kill-on-close Windows Job Object (single containment owner:
-//!   win32job, never cap-std), which also reaps grandchildren;
+//! - working directory is resolved through [`WorkspaceJail`] (the child's
+//!   initial cwd is inside the jail; the child itself is not filesystem-jailed);
+//! - stdout/stderr are capped; the child is bounded by a timeout;
+//! - process-tree containment is acquired **before** spawn: a kill-on-close
+//!   Windows Job Object (single containment owner: win32job, never cap-std)
+//!   holds the child and every descendant, and is closed on timeout,
+//!   cancellation, I/O failure, or return, reaping the whole tree;
+//! - on a host without that backend the call is refused by name with
+//!   [`E_SANDBOX_UNAVAILABLE`] instead of running uncontained;
 //! - run cancellation returns `E_TOOL_CANCELLED` after terminating the child.
+//!
+//! Residual limits (not fixed by this module): the Job Object controls process
+//! lifetime only — not filesystem, registry, or network access; the child runs
+//! with the server user's privileges and can read and write outside the jail;
+//! containment is assigned immediately after spawn, so a child that forks
+//! within that window before assignment is not captured; `git`/`cargo` still
+//! execute repository-controlled code (hooks, aliases, build scripts).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -137,10 +152,166 @@ pub fn validate_arguments(args: &[String]) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// The shell allowlist and resource caps.
+/// Per-command argument policy for one allowlisted executable.
+///
+/// A spec is the machine-checked half of the command allowlist: it bounds how
+/// many arguments one call may carry, refuses exact argument prefixes that
+/// re-point the executable at attacker-chosen code or configuration, and can
+/// require a fixed leading token (for example only `git --version`).
+///
+/// The spec validates *shape*, not intent: an allowed program that can itself
+/// execute code (`git`, `cargo`) still executes repository-controlled code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpec {
+    program: String,
+    first_arg_allowlist: Option<Vec<String>>,
+    denied_arg_prefixes: Vec<String>,
+    max_args: Option<usize>,
+}
+
+impl CommandSpec {
+    /// Builds a permissive spec (bounds/denials empty) for `program`.
+    #[must_use]
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into().trim().to_lowercase(),
+            first_arg_allowlist: None,
+            denied_arg_prefixes: Vec::new(),
+            max_args: None,
+        }
+    }
+
+    /// Requires the first argument to be one of `allowed` (exact,
+    /// case-insensitive); a call with no arguments is refused.
+    #[must_use]
+    pub fn with_first_arg_allowlist(mut self, allowed: impl IntoIterator<Item = String>) -> Self {
+        let mut allowed: Vec<String> = allowed
+            .into_iter()
+            .map(|token| token.trim().to_lowercase())
+            .filter(|token| !token.is_empty())
+            .collect();
+        allowed.sort();
+        allowed.dedup();
+        self.first_arg_allowlist = Some(allowed);
+        self
+    }
+
+    /// Refuses any argument that starts with one of `prefixes`.
+    ///
+    /// The comparison is case-sensitive on purpose: Windows flags such as git's
+    /// `-C` and `-c` differ only by case but mean completely different things,
+    /// so folding case would either ban `-c` or allow `-C`.
+    #[must_use]
+    pub fn with_denied_arg_prefixes(mut self, prefixes: impl IntoIterator<Item = String>) -> Self {
+        let mut prefixes: Vec<String> = prefixes
+            .into_iter()
+            .map(|prefix| prefix.trim().to_owned())
+            .filter(|prefix| !prefix.is_empty())
+            .collect();
+        prefixes.sort();
+        prefixes.dedup();
+        self.denied_arg_prefixes = prefixes;
+        self
+    }
+
+    /// Caps the argument count for this program (in addition to any global cap).
+    #[must_use]
+    pub fn with_max_args(mut self, max_args: usize) -> Self {
+        self.max_args = Some(max_args);
+        self
+    }
+
+    /// The bare program name this spec governs.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The configured argument cap, if any.
+    #[must_use]
+    pub fn max_args(&self) -> Option<usize> {
+        self.max_args
+    }
+
+    /// The configured leading-token allowlist, if any.
+    #[must_use]
+    pub fn first_arg_allowlist(&self) -> Option<&[String]> {
+        self.first_arg_allowlist.as_deref()
+    }
+
+    /// The configured denied argument prefixes.
+    #[must_use]
+    pub fn denied_arg_prefixes(&self) -> &[String] {
+        &self.denied_arg_prefixes
+    }
+
+    /// Validates `args` against this command's argument policy.
+    ///
+    /// # Errors
+    /// [`Refusal::ToolNotAllowed`] naming the violated rule (argument count,
+    /// denied prefix, or a first token outside the allowlist). The offending
+    /// argument is quoted only as a bounded excerpt.
+    pub fn validate_args(&self, args: &[String]) -> Result<(), ToolError> {
+        if let Some(max) = self.max_args {
+            if args.len() > max {
+                return Err(ToolError::new(
+                    Refusal::ToolNotAllowed,
+                    format!(
+                        "{} carries {} arguments; this command's policy caps it at {max}",
+                        self.program,
+                        args.len()
+                    ),
+                ));
+            }
+        }
+        for argument in args {
+            if let Some(prefix) = self
+                .denied_arg_prefixes
+                .iter()
+                .find(|prefix| argument.starts_with(prefix.as_str()))
+            {
+                return Err(ToolError::new(
+                    Refusal::ToolNotAllowed,
+                    format!(
+                        "{} argument {argument:?} starts with the policy-denied prefix \
+                         {prefix:?}; the command policy refuses arguments that re-point \
+                         the executable",
+                        self.program
+                    ),
+                ));
+            }
+        }
+        if let Some(allowed) = &self.first_arg_allowlist {
+            let first = args.first().map(String::as_str).unwrap_or("");
+            if !allowed
+                .iter()
+                .any(|token| token.eq_ignore_ascii_case(first))
+            {
+                return Err(ToolError::new(
+                    Refusal::ToolNotAllowed,
+                    format!(
+                        "{} must start with one of [{}]; {active} is not permitted by the \
+                         command policy",
+                        self.program,
+                        allowed.join(", "),
+                        active = if first.is_empty() {
+                            "an empty argument list".to_owned()
+                        } else {
+                            format!("{first:?}")
+                        }
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The shell allowlist, per-command argument policies, and resource caps.
 #[derive(Debug, Clone)]
 pub struct ShellPolicy {
     allowed_programs: Vec<String>,
+    command_specs: Vec<CommandSpec>,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     timeout: Duration,
@@ -149,6 +320,9 @@ pub struct ShellPolicy {
 impl ShellPolicy {
     /// Creates a policy from the program allowlist (comparison is
     /// case-insensitive on the bare executable name).
+    ///
+    /// Every allowlisted program starts with a permissive [`CommandSpec`];
+    /// call [`ShellPolicy::with_command_spec`] to add argument rules.
     #[must_use]
     pub fn new(allowed_programs: impl IntoIterator<Item = String>) -> Self {
         let mut allowed: Vec<String> = allowed_programs
@@ -158,12 +332,68 @@ impl ShellPolicy {
             .collect();
         allowed.sort();
         allowed.dedup();
+        let command_specs = allowed.iter().map(CommandSpec::new).collect();
         Self {
             allowed_programs: allowed,
+            command_specs,
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
             timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Adds or replaces the per-command argument policy for one program.
+    ///
+    /// A spec for a program that is not on the allowlist is retained but never
+    /// matches: the allowlist check runs first.
+    #[must_use]
+    pub fn with_command_spec(mut self, spec: CommandSpec) -> Self {
+        self.command_specs
+            .retain(|existing| existing.program() != spec.program());
+        self.command_specs.push(spec);
+        self
+    }
+
+    /// The spec governing `program`, if one exists.
+    #[must_use]
+    pub fn command_spec(&self, program: &str) -> Option<&CommandSpec> {
+        let program = program.trim().to_lowercase();
+        self.command_specs
+            .iter()
+            .find(|spec| spec.program() == program)
+    }
+
+    /// The full pre-spawn validation: interpreter denial, allowlist membership,
+    /// global argument escape forms, and the program's own argument policy.
+    ///
+    /// # Errors
+    /// [`Refusal::ToolNotAllowed`] for any violated rule; nothing is spawned and
+    /// no approval grant is consumed by a caller that validates before commit.
+    pub fn validate_invocation(&self, program: &str, args: &[String]) -> Result<(), ToolError> {
+        if is_shell_interpreter(program) {
+            return Err(ToolError::new(
+                Refusal::ToolNotAllowed,
+                format!(
+                    "program {program:?} is a command-interpreter host; interpreter hosts are \
+                     denied regardless of the allowlist"
+                ),
+            ));
+        }
+        if !self.allows(program) {
+            return Err(ToolError::new(
+                Refusal::ToolNotAllowed,
+                format!(
+                    "program {program:?} is not on the shell allowlist ({}); \
+                     path-qualified programs are refused",
+                    self.allowed_programs().join(", ")
+                ),
+            ));
+        }
+        validate_arguments(args)?;
+        if let Some(spec) = self.command_spec(program) {
+            spec.validate_args(args)?;
+        }
+        Ok(())
     }
 
     /// The default allowlist for v1 developer utilities.
@@ -177,7 +407,31 @@ impl ShellPolicy {
     /// interpreter host is refused regardless of this list.
     #[must_use]
     pub fn conservative_default() -> Self {
+        // `git -C`, `--git-dir`, `--work-tree`, `--exec-path` and the transport
+        // `--upload-pack`/`--receive-pack` flags re-point git at an attacker
+        // chosen directory, executable, or remote helper; they are refused so
+        // the resolved jail working directory is not silently overridden. This
+        // does NOT make git safe: aliases (`-c alias.x=!...`) still run
+        // arbitrary code with the server's privileges.
+        let git = CommandSpec::new("git.exe")
+            .with_max_args(64)
+            .with_denied_arg_prefixes([
+                "-C".to_owned(),
+                "--git-dir".to_owned(),
+                "--work-tree".to_owned(),
+                "--exec-path".to_owned(),
+                "--upload-pack".to_owned(),
+                "--receive-pack".to_owned(),
+            ]);
+        // `cargo --config` can inject a `target.<triple>.runner`/rustflags
+        // wrapper; the build scripts `cargo test` already runs remain
+        // arbitrary code, so this bounds one extra configuration channel only.
+        let cargo = CommandSpec::new("cargo.exe")
+            .with_max_args(64)
+            .with_denied_arg_prefixes(["--config".to_owned()]);
         Self::new(["git.exe".to_owned(), "cargo.exe".to_owned()])
+            .with_command_spec(git)
+            .with_command_spec(cargo)
     }
 
     /// Overrides the tool timeout.
@@ -279,39 +533,20 @@ pub struct ShellOutput {
 /// Executes an allowlisted program inside the jail.
 ///
 /// # Errors
-/// [`Refusal::ToolNotAllowed`] for a program outside the allowlist or a
-/// separator-bearing program string; [`Refusal::JailEscape`] for an escaping
-/// working directory; [`Refusal::ToolTimeout`] when the child exceeds the
-/// timeout (child terminated, grandchildren killed by the Job Object);
-/// [`Refusal::ToolCancelled`] when the run is cancelled; [`Refusal::InternalError`]
-/// for spawn/I/O failures.
+/// [`Refusal::ToolNotAllowed`] for a program outside the allowlist, a
+/// separator-bearing program string, or a per-command argument policy
+/// violation; [`Refusal::PathOutsideJail`] for an escaping working directory;
+/// [`E_SANDBOX_UNAVAILABLE`] when no OS process-tree sandbox exists (refused
+/// before spawn, never run uncontained); [`Refusal::ToolTimeout`] when the child
+/// exceeds the timeout (whole tree terminated); [`Refusal::ToolCancelled`] when
+/// the run is cancelled; [`Refusal::InternalError`] for spawn/I/O failures.
 pub async fn execute(
     jail: &WorkspaceJail,
     policy: &ShellPolicy,
     request: &ShellRequest,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ShellOutput, ToolError> {
-    if is_shell_interpreter(&request.program) {
-        return Err(ToolError::new(
-            Refusal::ToolNotAllowed,
-            format!(
-                "program {:?} is a command-interpreter host; interpreter hosts are denied \
-                 regardless of the allowlist",
-                request.program
-            ),
-        ));
-    }
-    if !policy.allows(&request.program) {
-        return Err(ToolError::new(
-            Refusal::ToolNotAllowed,
-            format!(
-                "program {:?} is not on the shell allowlist ({}); path-qualified programs are refused",
-                request.program,
-                policy.allowed_programs().join(", ")
-            ),
-        ));
-    }
-    validate_arguments(&request.args)?;
+    policy.validate_invocation(&request.program, &request.args)?;
     let cwd: PathBuf = match &request.cwd {
         Some(cwd) => jail.resolve(cwd)?,
         None => jail.root().to_path_buf(),
@@ -322,6 +557,11 @@ pub async fn execute(
             "shell working directory is not a directory inside the jail",
         ));
     }
+
+    // Containment is acquired BEFORE the child exists: a host that cannot
+    // provide a process-tree sandbox refuses by name instead of running the
+    // command uncontained.
+    let sandbox = acquire_process_tree_sandbox()?;
 
     let started = Instant::now();
     let mut command = Command::new(&request.program);
@@ -341,12 +581,13 @@ pub async fn execute(
         )
     })?;
 
-    // Windows containment owner: kill-on-close Job Object. Dropping the job at
-    // the end of this function kills any descendant still running.
-    #[cfg(windows)]
-    let job = create_kill_on_close_job()?;
-    #[cfg(windows)]
-    assign_to_job(&job, &child)?;
+    // Fail closed: if the child cannot be placed inside the Job Object, it is
+    // killed immediately and the call is refused by name rather than reported
+    // as contained.
+    if let Err(error) = sandbox.contain(&child) {
+        let _ = child.start_kill();
+        return Err(error);
+    }
 
     let stdout = child.stdout.take().ok_or_else(|| {
         ToolError::new(Refusal::InternalError, "child stdout pipe is unavailable")
@@ -375,6 +616,13 @@ pub async fn execute(
         }
     }
     .await;
+
+    if !matches!(&timed, Outcome::Finished(..)) {
+        // Timeout/cancellation/I/O: close the Job Object now so the whole
+        // process tree is terminated before the refusal is returned. The
+        // direct child is also killed by `kill_on_drop`.
+        drop(sandbox);
+    }
 
     match timed {
         Outcome::Finished(stdout, stdout_truncated, stderr, stderr_truncated, status) => {
@@ -453,33 +701,107 @@ async fn read_capped<R: AsyncRead + Unpin>(
     Ok((stored, truncated))
 }
 
+/// Named refusal code returned when no OS-level process-tree containment exists.
+///
+/// The frozen refusal table (`hiverouter-contract/src/refusal.rs`) has no
+/// sandbox variant and this module may not add one, so the *wire* code is
+/// [`Refusal::InternalError`] and this name is carried verbatim at the start of
+/// the error detail. Callers that need a first-class code must add a
+/// `SandboxUnavailable` variant to the contract table (out of scope here).
+pub const E_SANDBOX_UNAVAILABLE: &str = "E_SANDBOX_UNAVAILABLE";
+
+/// Whether this build can place a child process tree under OS containment.
+///
+/// Windows uses a kill-on-close Job Object ([`win32job`]); no other backend is
+/// implemented, so other hosts report `false` and refuse execution instead of
+/// running uncontained.
+#[must_use]
+pub const fn process_tree_sandbox_available() -> bool {
+    cfg!(windows)
+}
+
+/// The named instrumentation point for the containment requirement.
+///
+/// # Errors
+/// The [`E_SANDBOX_UNAVAILABLE`] refusal when `available` is false. Factored out
+/// so the refusal path is testable on hosts where the sandbox happens to work.
+pub fn ensure_process_tree_sandbox(available: bool) -> Result<(), ToolError> {
+    if available {
+        return Ok(());
+    }
+    Err(sandbox_unavailable(
+        "this host has no OS process-tree sandbox (Windows kill-on-close Job Object); \
+         shell_exec refuses rather than run an uncontained command. Update the host to \
+         Windows or add a sandbox backend",
+    ))
+}
+
+/// Builds the [`E_SANDBOX_UNAVAILABLE`] refusal.
+fn sandbox_unavailable(detail: impl std::fmt::Display) -> ToolError {
+    ToolError::new(
+        Refusal::InternalError,
+        format!("{E_SANDBOX_UNAVAILABLE}: {detail}"),
+    )
+}
+
+/// Kill-on-close Job Object containment for one shell child.
+///
+/// Contract: while this value is alive the child and every descendant it spawns
+/// belong to the job; dropping it terminates the whole tree. It is **not** a
+/// filesystem or network sandbox: the child keeps the server user's privileges
+/// and can read/write outside the jail.
 #[cfg(windows)]
-fn create_kill_on_close_job() -> Result<win32job::Job, ToolError> {
-    let mut info = win32job::ExtendedLimitInfo::new();
-    info.limit_kill_on_job_close();
-    win32job::Job::create_with_limit_info(&mut info).map_err(|error| {
-        ToolError::new(
-            Refusal::InternalError,
-            format!("failed to create the kill-on-close Job Object: {error}"),
-        )
-    })
+struct ProcessTreeSandbox {
+    job: win32job::Job,
 }
 
 #[cfg(windows)]
-fn assign_to_job(job: &win32job::Job, child: &Child) -> Result<(), ToolError> {
-    let handle = child.raw_handle().ok_or_else(|| {
-        ToolError::new(
-            Refusal::InternalError,
-            "child process handle is unavailable for Job Object assignment",
-        )
-    })?;
-    job.assign_process(handle as isize).map_err(|error| {
-        ToolError::new(
-            Refusal::InternalError,
-            format!("failed to assign the child process to the Job Object: {error}"),
-        )
-    })
+impl ProcessTreeSandbox {
+    fn create() -> Result<Self, ToolError> {
+        let mut info = win32job::ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        let job = win32job::Job::create_with_limit_info(&mut info)
+            .map_err(|error| sandbox_unavailable(format!("Job Object creation failed: {error}")))?;
+        Ok(Self { job })
+    }
+
+    fn contain(&self, child: &Child) -> Result<(), ToolError> {
+        let handle = child
+            .raw_handle()
+            .ok_or_else(|| sandbox_unavailable("child process handle is unavailable"))?;
+        self.job.assign_process(handle as isize).map_err(|error| {
+            sandbox_unavailable(format!(
+                "Job Object assignment failed, child terminated: {error}"
+            ))
+        })
+    }
 }
+
+/// Non-Windows: there is no containment backend, so acquisition refuses.
+#[cfg(not(windows))]
+struct ProcessTreeSandbox;
+
+#[cfg(not(windows))]
+impl ProcessTreeSandbox {
+    fn create() -> Result<Self, ToolError> {
+        Err(sandbox_unavailable(
+            "no non-Windows process-tree backend is implemented; shell_exec refuses \
+             rather than run an uncontained command",
+        ))
+    }
+
+    fn contain(&self, _child: &Child) -> Result<(), ToolError> {
+        Err(sandbox_unavailable(
+            "no non-Windows process-tree backend is implemented",
+        ))
+    }
+}
+
+fn acquire_process_tree_sandbox() -> Result<ProcessTreeSandbox, ToolError> {
+    ensure_process_tree_sandbox(process_tree_sandbox_available())?;
+    ProcessTreeSandbox::create()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -607,12 +929,29 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn child_process_does_not_inherit_the_provider_key() {
-        let previous = std::env::var_os(hiverouter_provider::API_KEY_ENV);
-        std::env::set_var(
-            hiverouter_provider::API_KEY_ENV,
-            "sk-shell-env-test-not-a-real-key",
-        );
+    async fn child_process_does_not_inherit_credentials() {
+        // Every canary mimics a credential name a provider, forge, or cloud SDK
+        // reads; the child environment is an allowlist, so none may reach it.
+        let canaries: [(&str, &str); 5] = [
+            (
+                hiverouter_provider::API_KEY_ENV,
+                "sk-shell-env-test-not-a-real-key",
+            ),
+            ("GITHUB_TOKEN", "ghp_shell_env_canary_not_a_real_token"),
+            (
+                "ANTHROPIC_API_KEY",
+                "sk-ant-shell-env-canary-not-a-real-key",
+            ),
+            ("AWS_SECRET_ACCESS_KEY", "aws-shell-env-canary-not-a-secret"),
+            ("HIVEROUTER_SESSION_TOKEN", "hvr-shell-env-canary-not-a-token"),
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = canaries
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in canaries {
+            std::env::set_var(name, value);
+        }
         let (_temp, jail) = jail();
         let policy = test_policy();
         // `git` runs the external alias through its own shell; the environment
@@ -626,9 +965,11 @@ mod tests {
             ],
         );
         let result = execute(&jail, &policy, &request, None).await;
-        match previous {
-            Some(value) => std::env::set_var(hiverouter_provider::API_KEY_ENV, value),
-            None => std::env::remove_var(hiverouter_provider::API_KEY_ENV),
+        for (name, previous) in saved {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
         let output = result.expect("executes");
         assert!(
@@ -641,11 +982,22 @@ mod tests {
             "env probe must print the child environment: {}",
             output.stdout
         );
-        assert!(
-            !output.stdout.contains("sk-shell-env-test-not-a-real-key"),
-            "child inherited the provider key: {}",
-            output.stdout
-        );
+        for (name, value) in canaries {
+            assert!(
+                !output.stdout.contains(value),
+                "child inherited {name}: {}",
+                output.stdout
+            );
+        }
+        // The sanitizer never whitelists a credential-shaped name.
+        for (name, _) in canaries {
+            assert!(
+                !crate::env_safety::ALLOWED_ENV
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(name)),
+                "{name} must not be on the child environment allowlist"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -658,6 +1010,183 @@ mod tests {
             .await
             .expect_err("timeout");
         assert_eq!(error.code(), "E_TOOL_TIMEOUT");
+    }
+
+    #[test]
+    fn sandbox_unavailable_is_a_named_refusal() {
+        ensure_process_tree_sandbox(true).expect("available sandbox passes");
+        let error = ensure_process_tree_sandbox(false).expect_err("unavailable");
+        assert_eq!(error.code(), "E_INTERNAL_ERROR");
+        assert!(
+            error.detail().starts_with(E_SANDBOX_UNAVAILABLE),
+            "the named refusal must lead the detail: {error}"
+        );
+        assert!(
+            error.detail().contains("no OS process-tree sandbox"),
+            "the refusal must say what is missing: {error}"
+        );
+        assert_eq!(
+            process_tree_sandbox_available(),
+            cfg!(windows),
+            "only Windows has the kill-on-close Job Object backend"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn execute_refuses_without_a_sandbox_backend() {
+        let (_temp, jail) = jail();
+        let policy = test_policy();
+        let request = ShellRequest::new("git.exe", vec!["--version".into()]);
+        let error = execute(&jail, &policy, &request, None)
+            .await
+            .expect_err("no sandbox backend");
+        assert_eq!(error.code(), "E_INTERNAL_ERROR");
+        assert!(error.detail().starts_with(E_SANDBOX_UNAVAILABLE));
+    }
+
+    #[tokio::test]
+    async fn cwd_escape_is_refused_before_spawn() {
+        let (_temp, jail) = jail();
+        let policy = test_policy();
+        for cwd in ["..", r"..\..", r"C:\Windows", r"\\server\share"] {
+            let request = ShellRequest::new("git.exe", vec!["--version".into()]).with_cwd(cwd);
+            let error = execute(&jail, &policy, &request, None)
+                .await
+                .expect_err(cwd);
+            assert_eq!(error.code(), "E_PATH_OUTSIDE_JAIL", "cwd {cwd:?}");
+            assert!(
+                error.detail().contains("outside the workspace jail")
+                    || error.detail().contains("refused"),
+                "cwd {cwd:?}: {error}"
+            );
+        }
+        // An in-jail cwd is still accepted, so the check is containment rather
+        // than a blanket ban on working directories.
+        let request = ShellRequest::new("git.exe", vec!["--version".into()]).with_cwd(".");
+        if process_tree_sandbox_available() {
+            execute(&jail, &policy, &request, None)
+                .await
+                .expect("in-jail cwd runs");
+        }
+    }
+
+    #[test]
+    fn per_command_argument_policy_is_enforced() {
+        let policy = ShellPolicy::conservative_default();
+        for args in [
+            vec!["-C".to_owned(), ".".to_owned()],
+            vec!["--upload-pack=evil".to_owned()],
+            vec!["--git-dir".to_owned(), "outside".to_owned()],
+            vec!["--work-tree=C:\\Windows".to_owned()],
+        ] {
+            let error = policy
+                .validate_invocation("git.exe", &args)
+                .expect_err(&format!("{args:?}"));
+            assert_eq!(error.code(), "E_TOOL_NOT_ALLOWED", "{args:?}");
+            assert!(
+                error.detail().contains("policy-denied prefix"),
+                "{args:?}: {error}"
+            );
+        }
+        // The lowercase `-c` configuration flag is a different flag and stays
+        // allowed: the denied-prefix comparison is case-sensitive.
+        policy
+            .validate_invocation(
+                "git.exe",
+                &[
+                    "-c".to_owned(),
+                    "core.fsmonitor=false".to_owned(),
+                    "status".to_owned(),
+                ],
+            )
+            .expect("lowercase -c is not -C");
+        policy
+            .validate_invocation(
+                "cargo.exe",
+                &["test".to_owned(), "--lib".to_owned()],
+            )
+            .expect("cargo test is allowed");
+        assert_eq!(
+            policy
+                .validate_invocation("cargo.exe", &["--config=evil.toml".to_owned()])
+                .expect_err("cargo --config")
+                .code(),
+            "E_TOOL_NOT_ALLOWED"
+        );
+    }
+
+    #[test]
+    fn first_argument_allowlist_pins_the_command_shape() {
+        let strict = ShellPolicy::new(["git.exe".to_owned()]).with_command_spec(
+            CommandSpec::new("git.exe")
+                .with_first_arg_allowlist(["--version".to_owned()])
+                .with_max_args(1),
+        );
+        strict
+            .validate_invocation("git.exe", &["--version".to_owned()])
+            .expect("pinned shape");
+        for args in [
+            Vec::<String>::new(),
+            vec!["-c".to_owned(), "core.fsmonitor=false".to_owned()],
+            vec!["--version".to_owned(), "--verbose".to_owned()],
+        ] {
+            let error = strict
+                .validate_invocation("git.exe", &args)
+                .expect_err(&format!("{args:?}"));
+            assert_eq!(error.code(), "E_TOOL_NOT_ALLOWED", "{args:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_tree() {
+        // The marker is the duration of a grandchild `sleep`; if the Job Object
+        // did not reap the tree it would linger for days. The marker is unique
+        // to this test so a scan of the process table is unambiguous.
+        let marker = "424242";
+        let (_temp, jail) = jail();
+        let policy = test_policy().with_timeout(Duration::from_millis(500));
+        let request = ShellRequest::new(
+            "git.exe",
+            vec![
+                "-c".to_owned(),
+                format!("alias.hive-tree=!sh -c \"sleep {marker}; sleep 424243\""),
+                "hive-tree".to_owned(),
+            ],
+        );
+        let error = execute(&jail, &policy, &request, None)
+            .await
+            .expect_err("timeout");
+        assert_eq!(error.code(), "E_TOOL_TIMEOUT");
+
+        use sysinfo::{ProcessesToUpdate, System};
+        let mut system = System::new_all();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let current = sysinfo::get_current_pid().expect("current pid");
+        assert!(
+            system.process(current).is_some(),
+            "the process table and command lines must be readable for this proof"
+        );
+        let mut reaped = false;
+        for _ in 0..50 {
+            system.refresh_processes(ProcessesToUpdate::All, true);
+            let alive = system.processes().values().any(|process| {
+                process
+                    .cmd()
+                    .iter()
+                    .any(|argument| argument.to_string_lossy().contains(marker))
+            });
+            if !alive {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            reaped,
+            "grandchild `sleep {marker}` survived the timeout: the process tree was not killed"
+        );
     }
 
     #[cfg(windows)]

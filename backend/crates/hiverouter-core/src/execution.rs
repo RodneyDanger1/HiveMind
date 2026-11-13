@@ -85,9 +85,10 @@ fn run_tests_is_full_suite(plan: &ToolCallPlan) -> bool {
 }
 
 /// Shell commands can mutate the workspace despite being Execute-class. Treat
-/// known mutating git/cargo invocations as mutations; read-only queries do not
-/// demand a test run.
-fn shell_command_mutates(plan: &ToolCallPlan) -> bool {
+/// known mutating git/cargo invocations and file-mutating programs/redirections
+/// as mutations; read-only queries do not demand a test run.
+#[must_use]
+pub fn shell_command_mutates(plan: &ToolCallPlan) -> bool {
     let Some(program) = plan.args.get("program").and_then(serde_json::Value::as_str) else {
         return false;
     };
@@ -103,6 +104,18 @@ fn shell_command_mutates(plan: &ToolCallPlan) -> bool {
         })
         .unwrap_or_default();
     let program = program.to_ascii_lowercase();
+    // A shell redirection writes a file (`echo x > f`, `cmd 2>err`), so it is a
+    // workspace mutation even when the program itself is read-only. `>&` is a
+    // descriptor redirect, not a file write.
+    if args
+        .iter()
+        .any(|arg| arg.contains('>') && !arg.contains('&'))
+    {
+        return true;
+    }
+    if shell_program_mutates(&program) {
+        return true;
+    }
     let mut index = 0;
     // Skip git global options so `git -C repo commit` is still recognized.
     while index < args.len() {
@@ -152,6 +165,43 @@ fn shell_command_mutates(plan: &ToolCallPlan) -> bool {
     false
 }
 
+/// File-mutating programs that are not expressed as a git/cargo subcommand.
+/// Detection is deliberately conservative: a false positive only forces a test
+/// run before `finish`, while a false negative lets an unverified mutation
+/// complete the task.
+fn shell_program_mutates(program: &str) -> bool {
+    let base = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim_end_matches(".exe");
+    matches!(
+        base,
+        "rm" | "rmdir"
+            | "del"
+            | "erase"
+            | "mv"
+            | "move"
+            | "cp"
+            | "copy"
+            | "tee"
+            | "touch"
+            | "chmod"
+            | "chown"
+            | "ln"
+            | "mkdir"
+            | "md"
+            | "set-content"
+            | "add-content"
+            | "out-file"
+            | "new-item"
+            | "remove-item"
+            | "copy-item"
+            | "move-item"
+            | "rename-item"
+    )
+}
+
 /// Parses the bounded run_tests JSON prefix; stdout may be truncated later.
 fn run_tests_succeeded(text: &str) -> bool {
     let head = text.split(",\"stdout\"").next().unwrap_or(text);
@@ -165,7 +215,8 @@ fn run_tests_succeeded(text: &str) -> bool {
 /// True when there is no mutation, or the last mutation has a later passing
 /// run_tests. A refused/failed test run does not verify, and a later mutation
 /// revokes earlier verification.
-fn terminal_verified(
+#[must_use]
+pub fn terminal_verified(
     transcript: &[ToolTurnTranscript],
     current: &[(ToolCallPlan, ToolExecution)],
 ) -> bool {
@@ -2568,11 +2619,18 @@ impl RunEngine {
             root_prompt.push_str(
                 "\n\nYou are the HyperAgent orchestrator. Produce the final answer for this run \
                  from the completed task results below. Do not invent missing results; explicitly \
-                 note any task that has none.\n",
+                 note any task that has none. A task whose state is not `Completed` did not \
+                 finish: report it as unfinished and never present its work as done.\n",
             );
             let all_tasks = self.store.tasks_for_run(run.id)?;
             let mut digest = format!("Run digest: {} task(s).\n", all_tasks.len());
+            let mut unfinished_children = 0usize;
             for child in all_tasks.iter().filter(|task| task.id != root.id) {
+                // A failed/cancelled child is not the same as a child that
+                // produced no text: the root must not present its work as done.
+                if child.state != AgentState::Completed {
+                    unfinished_children = unfinished_children.saturating_add(1);
+                }
                 match self.store.task_result(child.id) {
                     Ok(Some(text)) if !text.trim().is_empty() => {
                         let bounded: String = tool_loop::bounded_tool_text(&text)
@@ -2580,10 +2638,16 @@ impl RunEngine {
                             .map(|character| if character.is_control() { ' ' } else { character })
                             .take(400)
                             .collect();
-                        digest.push_str(&format!("Task {} ({}): {}\n", child.id, child.role, bounded));
+                        digest.push_str(&format!(
+                            "Task {} ({} state={:?}): {}\n",
+                            child.id, child.role, child.state, bounded
+                        ));
                     }
                     Ok(_) | Err(_) => {
-                        digest.push_str(&format!("Task {} ({}): no recorded result.\n", child.id, child.role));
+                        digest.push_str(&format!(
+                            "Task {} ({} state={:?}): no recorded result.\n",
+                            child.id, child.role, child.state
+                        ));
                     }
                 }
                 if digest.chars().count() > 6_000 {
@@ -2603,13 +2667,17 @@ impl RunEngine {
                             .take(ROOT_RESULT_LIMIT)
                             .collect();
                         format!(
-                            "\nTask {} (role {}):\n{}\n",
+                            "\nTask {} (role {}, state={:?}):\n{}\n",
                             child.id,
                             child.role,
+                            child.state,
                             sanitized
                         )
                     }
-                    Some(_) | None => format!("\nTask {} has no recorded result.\n", child.id),
+                    Some(_) | None => format!(
+                        "\nTask {} (state {:?}) has no recorded result.\n",
+                        child.id, child.state
+                    ),
                 };
                 if root_prompt.chars().count() + text.chars().count() > ROOT_PROMPT_BUDGET {
                     omitted += 1;
@@ -2622,11 +2690,21 @@ impl RunEngine {
                     "\n[{omitted} completed task result(s) omitted by the root prompt budget]\n"
                 ));
             }
+            if unfinished_children > 0 {
+                root_prompt.push_str(&format!(
+                    "\n[{unfinished_children} task(s) did not complete successfully (see the \
+                     per-task states above: failed/cancelled/interrupted). Report their work as \
+                     unfinished; never claim their results in the final answer.]\n"
+                ));
+            }
             // One bounded, read-only post-dispatch monitor turn. It is separate
             // from the final answer, cannot call tools, and its text is appended
             // as labelled data. Test doubles disable it so their budgets stay
             // deterministic.
-            if self.root_orchestrator && self.executor.supports_root_review() {
+            if self.root_orchestrator
+                && self.executor.supports_root_review()
+                && all_tasks.iter().any(|task| task.id != root.id)
+            {
                 self.claim_provider_call(run.id)?;
                 let mut monitor_prompt = String::from(
                     "Post-dispatch monitor review. Task states and bounded results follow. \
@@ -3020,9 +3098,12 @@ impl RunEngine {
         };
 
         let mut executed: Vec<(ToolCallPlan, ToolExecution)> = Vec::new();
-        let mut precounted: u32 = 0;
-        let mut calls_in_turn: u32 = 0;
         let mut budget_refused = false;
+        // Charge the turn before its calls run: a terminal approval wait returns
+        // `Err` mid-turn and must not erase an already-started tool turn.
+        self.db
+            .increment_run_tool_counters(run.id, 1, 0)
+            .map_err(|error| error.refusal())?;
         for (index, call) in reply.tool_calls.iter().enumerate() {
             if token.is_cancelled() {
                 return Err(Refusal::ToolCancelled);
@@ -3031,6 +3112,9 @@ impl RunEngine {
             // Count every attempted call, including refusals, so a model cannot
             // loop for free on rejected calls.
             let used_before = used_calls.saturating_add(index);
+            // Set when the approval branch already charged this attempt before
+            // arming its wait, so the call is never counted twice.
+            let mut precounted_this_call = false;
             let execution = match tool_loop::check_call_budget(used_before) {
                 Err(refusal) => {
                     budget_refused = true;
@@ -3105,7 +3189,7 @@ impl RunEngine {
                                         self.db
                                             .increment_run_tool_counters(run.id, 0, 1)
                                             .map_err(|error| error.refusal())?;
-                                        precounted = precounted.saturating_add(1);
+                                        precounted_this_call = true;
                                         self.suspend_for_approval(
                                             run, task, call, &plan, turn, token,
                                         )
@@ -3200,7 +3284,7 @@ impl RunEngine {
                                             self.db
                                                 .increment_run_tool_counters(run.id, 0, 1)
                                                 .map_err(|error| error.refusal())?;
-                                            precounted = precounted.saturating_add(1);
+                                            precounted_this_call = true;
                                             // Terminal waits finalize their own TOOL_RESULT and
                                             // return Err (D13); approve/deny return Ok.
                                             self.suspend_for_approval(
@@ -3219,17 +3303,15 @@ impl RunEngine {
                     }
                 },
             };
-            calls_in_turn = calls_in_turn.saturating_add(1);
+            // Charge the attempted call as soon as its outcome exists: a failing
+            // `finish_tool_call` or an early return from a terminal approval wait
+            // must not leave already-executed calls uncounted.
+            if !precounted_this_call {
+                self.db
+                    .increment_run_tool_counters(run.id, 0, 1)
+                    .map_err(|error| error.refusal())?;
+            }
             self.finish_tool_call(run, task, call, &execution, turn)?;
-        }
-        if calls_in_turn > 0 {
-            self.db
-                .increment_run_tool_counters(
-                    run.id,
-                    1,
-                    calls_in_turn.saturating_sub(precounted),
-                )
-                .map_err(|error| error.refusal())?;
         }
         Ok(ToolTurnResult {
             cap_reached: false,
@@ -3708,10 +3790,12 @@ impl RunEngine {
         }
         let waits = tools
             .approval_count_for_run(run.id)?;
-        if waits >= u64::from(tool_loop::MAX_APPROVAL_WAITS_PER_RUN) {
+        if let Err(refusal) = tool_loop::check_approval_wait_budget(
+            u32::try_from(waits).unwrap_or(u32::MAX),
+        ) {
             return Ok(ToolExecution::refused(
                 plan.tool_call_id.clone(),
-                Refusal::CallLimit.code(),
+                refusal.code(),
                 format!(
                     "approval wait budget exhausted ({waits} of {}); nothing executed",
                     tool_loop::MAX_APPROVAL_WAITS_PER_RUN
@@ -3724,6 +3808,22 @@ impl RunEngine {
         // racing the Suspend edge and failing the whole run.
         let slot = self.approval_slot(run.id)?;
         let _slot_guard = slot.lock().await;
+        // Re-read the wait count under the slot: the pre-slot check races with a
+        // concurrent task arming its own wait, so two tasks can both pass the
+        // check and arm one wait past the cap.
+        let waits = tools.approval_count_for_run(run.id)?;
+        if let Err(refusal) = tool_loop::check_approval_wait_budget(
+            u32::try_from(waits).unwrap_or(u32::MAX),
+        ) {
+            return Ok(ToolExecution::refused(
+                plan.tool_call_id.clone(),
+                refusal.code(),
+                format!(
+                    "approval wait budget exhausted ({waits} of {}); nothing executed",
+                    tool_loop::MAX_APPROVAL_WAITS_PER_RUN
+                ),
+            ));
+        }
         if token.is_cancelled() {
             return Ok(ToolExecution::refused(
                 plan.tool_call_id.clone(),

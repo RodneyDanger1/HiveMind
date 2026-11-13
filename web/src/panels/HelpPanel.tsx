@@ -146,7 +146,9 @@ export function HelpPanel() {
                   <h3 id={`help-tutorial-${index}`} className="hm-card-title">
                     {tutorial.title}
                   </h3>
-                  <span className="help-card-hex" aria-hidden="true" />
+                  <span className="help-card-hex" aria-hidden="true">
+                    <span className="help-card-index">{String(index + 1).padStart(2, '0')}</span>
+                  </span>
                 </div>
                 <ol className="hm-steps mt-3">
                   {tutorial.steps.map((step) => (
@@ -154,6 +156,12 @@ export function HelpPanel() {
                   ))}
                 </ol>
               </section>
+            ))}
+          </div>
+
+          <div className="help-divider" aria-hidden="true">
+            {[0, 1, 2, 3, 4].map((cell) => (
+              <span key={cell} />
             ))}
           </div>
 
@@ -165,7 +173,12 @@ export function HelpPanel() {
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
             {FEATURES.map(([name, text], index) => (
               <div key={`${name}-${index}`} className="help-feature">
-                <div className="hm-eyebrow text-ink-800">{name}</div>
+                <div className="flex items-baseline gap-2">
+                  <span className="help-feature-index" aria-hidden="true">
+                    {String(index + 1).padStart(2, '0')}
+                  </span>
+                  <div className="hm-eyebrow min-w-0 text-ink-800">{name}</div>
+                </div>
                 <p className="mt-1 text-[12px] leading-[17px] text-ink-500">{text}</p>
               </div>
             ))}

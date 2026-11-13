@@ -9,6 +9,46 @@ use serde::{Deserialize, Serialize};
 /// Maximum plan nodes / super-steps (blueprint §2a: 40-call ceiling).
 pub const MAX_PLAN_NODES: usize = 40;
 
+/// Maximum branch leads the root may carry and maximum children one planned
+/// parent may carry. Both equal the engine fan-out cap, so a plan that passes
+/// validation can never fail mid-dispatch on `E_FANOUT_LIMIT` after some task
+/// rows were already persisted.
+pub const MAX_PLAN_FANOUT: usize = crate::caps::MAX_FANOUT;
+
+/// Canonical SuperAgent persona ids. These may only appear at depth 1.
+pub const BRANCH_LEAD_ROLES: &[&str] = &["superagent"];
+
+/// Canonical worker persona ids. These may only appear at depth 2.
+pub const WORKER_ROLES: &[&str] = &[
+    "agent",
+    "content-writer",
+    "data-analyst",
+    "code-reviewer",
+    "chatbot",
+];
+
+/// Canonical Subagent persona id. It may only appear at depth 3.
+pub const SUBAGENT_ROLES: &[&str] = &["subagent"];
+
+/// The only depth a canonical persona id may occupy, if it is one.
+///
+/// Legacy class aliases (`super`, `worker`, ...) return `None`: the engine
+/// resolves them by class and keeps its historical acceptance. Canonical
+/// persona ids are what the planner prompt asks for, so a canonical id at the
+/// wrong depth is refused before any task row exists.
+fn canonical_role_depth(role: &str) -> Option<u8> {
+    let role = role.trim().to_ascii_lowercase();
+    if BRANCH_LEAD_ROLES.contains(&role.as_str()) {
+        Some(1)
+    } else if WORKER_ROLES.contains(&role.as_str()) {
+        Some(2)
+    } else if SUBAGENT_ROLES.contains(&role.as_str()) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
 /// One planned node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanNode {
@@ -41,12 +81,19 @@ impl Plan {
         Self { nodes }
     }
 
-    /// Validates the plan DAG: non-empty, <= 40 nodes, unique ids, deps refer to
-    /// known nodes, and no cycle.
+    /// Validates the plan DAG before dispatch: non-empty, <= 40 nodes, unique
+    /// ids, unique deps, known deps, a tree-shaped parent chain, no cycle across
+    /// either dependency direction, resolvable roles at their ladder depth, and
+    /// a fan-out the engine can actually spawn.
     ///
     /// # Errors
-    /// `E_CALL_LIMIT` when over the node cap; `E_SCHEMA_INVALID` for duplicate
-    /// ids, unknown deps or a cycle (cycle refused at plan validation).
+    /// `E_CALL_LIMIT` when over the node cap; `E_FANOUT_LIMIT` when the root
+    /// would carry more than [`MAX_PLAN_FANOUT`] branch leads or one parent more
+    /// than that many children (refused here, not mid-dispatch); `E_PERSONA_UNKNOWN`
+    /// for a role the engine cannot resolve; `E_TOOL_NOT_ALLOWED` for a canonical
+    /// persona id at the wrong depth; `E_SCHEMA_INVALID` for duplicate ids,
+    /// duplicate/unknown deps, a parent/dependency cycle (both directions) or a
+    /// non-tree parent chain.
     pub fn validate(&self) -> Result<(), Refusal> {
         if self.nodes.is_empty() {
             return Err(Refusal::SchemaInvalid);
@@ -67,8 +114,9 @@ impl Plan {
             if node.depth > 3 {
                 return Err(Refusal::SpawnDepth);
             }
+            let mut unique_deps = HashSet::with_capacity(node.deps.len());
             for dep in &node.deps {
-                if !known.contains(dep) {
+                if !known.contains(dep) || !unique_deps.insert(*dep) {
                     return Err(Refusal::SchemaInvalid);
                 }
             }
@@ -100,8 +148,9 @@ impl Plan {
                 }
                 None => {}
             }
-            // A dependency on a descendant is a cross-edge cycle: the parent
-            // already waits for that descendant to complete.
+            // The parent edge is an aggregation barrier in both directions: the
+            // parent waits for the child, so a dependency on a descendant is a
+            // cycle...
             for dep in &node.deps {
                 let mut cursor = Some(*dep);
                 while let Some(id) = cursor {
@@ -110,6 +159,17 @@ impl Plan {
                     }
                     cursor = by_id.get(&id).and_then(|item| item.parent);
                 }
+            }
+            // ...and a dependency on an ancestor is the mirror cycle: the
+            // ancestor waits for this node's parent chain, which waits for this
+            // node. Only the descendant direction used to be checked, so a plan
+            // could pass validation and then deadlock in the readiness loop.
+            let mut ancestor = node.parent;
+            while let Some(id) = ancestor {
+                if node.deps.contains(&id) {
+                    return Err(Refusal::SchemaInvalid);
+                }
+                ancestor = by_id.get(&id).and_then(|item| item.parent);
             }
             // A parent chain that loops would make the hierarchy non-tree-shaped
             // even though the dependency graph is acyclic.
@@ -121,6 +181,28 @@ impl Plan {
                 }
                 current = by_id.get(&id).and_then(|item| item.parent);
             }
+        }
+        // Role and fan-out policy. Both are checked here (before the engine
+        // persists the root) so a shape the dispatch loop would refuse anyway
+        // fails as one named plan refusal instead of a half-built graph.
+        let mut root_children = 0usize;
+        let mut children: HashMap<TaskId, usize> = HashMap::new();
+        for node in &self.nodes {
+            if crate::execution::role_class(&node.role).is_none() {
+                return Err(Refusal::PersonaUnknown);
+            }
+            if canonical_role_depth(&node.role).is_some_and(|depth| depth != node.depth) {
+                return Err(Refusal::ToolNotAllowed);
+            }
+            match node.parent {
+                Some(parent) => *children.entry(parent).or_insert(0) += 1,
+                None => root_children = root_children.saturating_add(1),
+            }
+        }
+        if root_children > MAX_PLAN_FANOUT
+            || children.values().any(|count| *count > MAX_PLAN_FANOUT)
+        {
+            return Err(Refusal::FanoutLimit);
         }
         if self.topo_order()?.len() != self.nodes.len() {
             return Err(Refusal::SchemaInvalid);
@@ -136,7 +218,11 @@ impl Plan {
         let mut indegree: HashMap<TaskId, usize> =
             self.nodes.iter().map(|node| (node.node_id, 0)).collect();
         for node in &self.nodes {
-            for dep in &node.deps {
+            // Count each distinct dependency once. Validation refuses duplicate
+            // deps by name; counting them twice here would make a duplicate-dep
+            // DAG look like a cycle (`E_SCHEMA_INVALID`) instead.
+            let unique_deps: HashSet<TaskId> = node.deps.iter().copied().collect();
+            for dep in unique_deps {
                 if let Some(entry) = indegree.get_mut(&node.node_id) {
                     *entry += 1;
                     let _ = dep;
@@ -302,7 +388,7 @@ mod tests {
         let mut agent = node("worker", Vec::new(), 2);
         agent.parent = Some(super_agent.node_id);
         let subagent = {
-            let mut sub = node("worker", Vec::new(), 3);
+            let mut sub = node("subagent", Vec::new(), 3);
             sub.parent = Some(agent.node_id);
             sub
         };
@@ -336,5 +422,97 @@ mod tests {
         item.parent = Some(id);
         let plan = Plan::new(vec![item]);
         assert_eq!(plan.validate(), Err(Refusal::SchemaInvalid));
+    }
+
+    #[test]
+    fn ancestor_dependency_is_a_cycle_and_is_refused() {
+        // The parent edge makes each ancestor wait for its descendants, so a
+        // depth-3 node depending on its depth-1 grandparent is the mirror of the
+        // descendant cycle: the whole branch deadlocks in the readiness loop.
+        let mut lead = node("super", Vec::new(), 1);
+        let mut agent = node("worker", Vec::new(), 2);
+        agent.parent = Some(lead.node_id);
+        let mut sub = node("subagent", vec![lead.node_id], 3);
+        sub.parent = Some(agent.node_id);
+        lead.parent = None;
+        let plan = Plan::new(vec![lead, agent, sub]);
+        assert_eq!(plan.validate(), Err(Refusal::SchemaInvalid));
+    }
+
+    #[test]
+    fn duplicate_dependency_is_refused_not_reported_as_a_cycle() {
+        let mut lead = node("super", Vec::new(), 1);
+        let mut agent = node("worker", Vec::new(), 2);
+        agent.parent = Some(lead.node_id);
+        agent.deps = vec![lead.node_id, lead.node_id];
+        lead.parent = None;
+        let plan = Plan::new(vec![lead, agent]);
+        assert_eq!(plan.validate(), Err(Refusal::SchemaInvalid));
+        // A duplicate dep is not a graph cycle: ordering still completes.
+        assert_eq!(plan.topo_order().expect("ordering").len(), 2);
+    }
+
+    #[test]
+    fn unknown_planned_role_is_refused_before_dispatch() {
+        // The engine refuses `researcher` mid-dispatch with E_PERSONA_UNKNOWN;
+        // the plan must refuse it before the root row exists.
+        let plan = Plan::new(vec![node("researcher", Vec::new(), 1)]);
+        assert_eq!(plan.validate(), Err(Refusal::PersonaUnknown));
+    }
+
+    #[test]
+    fn canonical_role_at_the_wrong_depth_is_refused() {
+        let mut lead = node("super", Vec::new(), 1);
+        let mut worker = node("superagent", Vec::new(), 2);
+        worker.parent = Some(lead.node_id);
+        lead.parent = None;
+        let plan = Plan::new(vec![lead, worker]);
+        assert_eq!(plan.validate(), Err(Refusal::ToolNotAllowed));
+
+        let worker_at_lead_depth = Plan::new(vec![node("agent", Vec::new(), 1)]);
+        assert_eq!(
+            worker_at_lead_depth.validate(),
+            Err(Refusal::ToolNotAllowed)
+        );
+    }
+
+    #[test]
+    fn root_fanout_over_the_engine_cap_is_refused() {
+        let nodes: Vec<PlanNode> = (0..=MAX_PLAN_FANOUT)
+            .map(|_| node("super", Vec::new(), 1))
+            .collect();
+        let plan = Plan::new(nodes);
+        assert_eq!(plan.validate(), Err(Refusal::FanoutLimit));
+    }
+
+    #[test]
+    fn per_parent_fanout_over_the_engine_cap_is_refused() {
+        let mut lead = node("super", Vec::new(), 1);
+        lead.parent = None;
+        let mut nodes = vec![lead.clone()];
+        for _ in 0..=MAX_PLAN_FANOUT {
+            let mut worker = node("worker", Vec::new(), 2);
+            worker.parent = Some(lead.node_id);
+            nodes.push(worker);
+        }
+        let plan = Plan::new(nodes);
+        assert_eq!(plan.validate(), Err(Refusal::FanoutLimit));
+    }
+
+    #[test]
+    fn a_three_item_request_has_a_minimal_valid_shape() {
+        // Exactly one lead per requested item, one worker per lead: the shape
+        // the planner prompt asks for, accepted without a node-count refusal.
+        let mut nodes = Vec::new();
+        for _ in 0..3u8 {
+            let lead = node("superagent", Vec::new(), 1);
+            let mut worker = node("agent", Vec::new(), 2);
+            worker.parent = Some(lead.node_id);
+            nodes.push(lead);
+            nodes.push(worker);
+        }
+        let plan = Plan::new(nodes);
+        plan.validate().expect("three-item plan is valid");
+        assert_eq!(plan.topo_order().expect("order").len(), 6);
     }
 }

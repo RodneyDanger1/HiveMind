@@ -118,7 +118,9 @@ function CanvasInner() {
   const reduced = useAppReducedMotion();
   const { setCenter, getZoom, zoomIn, zoomOut, fitView, getIntersectingNodes, getNode } = useReactFlow();
   const viewport = useViewport();
-  const [zoomLabel, setZoomLabel] = useState('100%');
+  // Derived from the live viewport: the old local label started at "100%"
+  // and only changed on the first onMoveEnd, so it went stale after a fit.
+  const zoomLabel = zoomPercent(viewport.zoom);
   const [positionOverrides, setPositionOverrides] = useState<PositionMap>({});
   const [hideFinished, setHideFinished] = useState(false);
   const [focusBranch, setFocusBranch] = useState(false);
@@ -132,6 +134,20 @@ function CanvasInner() {
   const chatVisible = useUiStore((state) => state.chat.visible);
   const runStatus = useUiStore((state) => state.run?.status ?? null);
   const interactiveGraph = runStatus !== null && isRunActive(runStatus);
+  const replaying = history.replayGraph !== null;
+  const runLabel = replaying
+    ? STRINGS.states.replay
+    : runStatus === null
+      ? 'No run'
+      : STRINGS.agentStates[runStatus];
+
+  useEffect(() => {
+    // Focus-branch has no meaning without a selection; leaving it pressed made
+    // the next clicked card silently filter the graph.
+    if (selectedTaskId === null && focusBranch) {
+      setFocusBranch(false);
+    }
+  }, [selectedTaskId, focusBranch]);
 
   useEffect(() => {
     setPositionOverrides(loadPositions(runId));
@@ -518,13 +534,18 @@ function CanvasInner() {
           </div>
         </div>
       )}
-      <div className="absolute left-3 top-16 z-20 flex items-center gap-1">
+      <div className="absolute left-3 top-16 z-20 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-1">
         <button
           type="button"
           aria-pressed={hideFinished}
-          disabled={Object.keys(tasks).length === 0}
+          disabled={replaying || Object.keys(tasks).length === 0}
+          title={
+            replaying
+              ? 'Filters are disabled while viewing a read-only replay'
+              : 'Hide completed and failed cards that have no visible descendants'
+          }
           className={
-            'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 ' +
+            'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50 ' +
             (hideFinished
               ? 'border-honey-500 bg-honey-100 text-ink-900'
               : 'border-hairline bg-panel text-ink-500 hover:bg-honey-100')
@@ -536,10 +557,16 @@ function CanvasInner() {
         <button
           type="button"
           aria-pressed={focusBranch}
-          disabled={selectedTaskId === null}
-          title={selectedTaskId === null ? 'Select a node to focus its branch' : 'Show only the selected branch'}
+          disabled={replaying || selectedTaskId === null}
+          title={
+            replaying
+              ? 'Filters are disabled while viewing a read-only replay'
+              : selectedTaskId === null
+                ? 'Select a node to focus its branch'
+                : 'Show only the selected branch'
+          }
           className={
-            'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 disabled:opacity-50 ' +
+            'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50 ' +
             (focusBranch
               ? 'border-honey-500 bg-honey-100 text-ink-900'
               : 'border-hairline bg-panel text-ink-500 hover:bg-honey-100')
@@ -548,10 +575,37 @@ function CanvasInner() {
         >
           Focus branch
         </button>
-        <span className="type-mono-meta rounded-[var(--radius-pill)] border border-hairline bg-panel px-2 py-1 text-meta">
+        <span
+          className="type-mono-meta rounded-[var(--radius-pill)] border border-hairline bg-panel px-2 py-1 text-meta"
+          title="Cards visible after the active filters / cards in this graph"
+        >
           {Object.keys(displayedVisibleTasks).length}/{Object.keys(displayedTasks).length}
         </span>
-
+        <span
+          data-testid="canvas-run-status"
+          data-run-status={replaying ? 'replay' : (runStatus ?? 'none')}
+          title={
+            replaying
+              ? 'Read-only replay of a committed revision; drag and filters are off'
+              : runStatus === null
+                ? 'No run has been created in this session yet'
+                : `Active run status: ${STRINGS.agentStates[runStatus]}`
+          }
+          className={
+            'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 ' +
+            (replaying
+              ? 'border-ink-500 bg-recessed text-ink-800'
+              : runStatus === null
+                ? 'border-hairline bg-panel text-meta'
+                : runStatus === 'failed'
+                  ? 'border-signal bg-signal/10 text-signal'
+                  : runStatus !== null && isRunActive(runStatus)
+                    ? 'border-honey-500 bg-honey-100 text-ink-900'
+                    : 'border-verify bg-verify/10 text-verify')
+          }
+        >
+          RUN · {runLabel}
+        </span>
       </div>
       <ReactFlow
         nodes={history.replayGraph ? replayNodes : liveNodes}
@@ -597,7 +651,6 @@ function CanvasInner() {
           }
         }}
         onMoveEnd={(_, viewport) => {
-          setZoomLabel(zoomPercent(viewport.zoom));
           setViewport(viewport);
         }}
         fitView={history.replayGraph !== null}

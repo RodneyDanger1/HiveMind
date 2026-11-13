@@ -49,9 +49,10 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use thiserror::Error;
 
@@ -86,6 +87,33 @@ pub const MAX_READ_BYTES: usize = 512 * 1024;
 pub const MAX_SEARCH_LIMIT: usize = 100;
 /// Maximum length of an FTS5 query string passed to [`search_chunks`].
 pub const MAX_SEARCH_QUERY_BYTES: usize = 4_096;
+/// Maximum symbol declarations extracted from one indexed file.
+pub const MAX_SYMBOLS_PER_FILE: usize = 512;
+/// Maximum hits returned by [`search_symbols`] (hard cap, never raised).
+pub const MAX_SYMBOL_RESULTS: usize = 50;
+/// Maximum length of a symbol-name query.
+pub const MAX_SYMBOL_QUERY_BYTES: usize = 256;
+/// Maximum bytes kept in one stored symbol signature.
+pub const MAX_SYMBOL_SIGNATURE_BYTES: usize = 300;
+
+/// Symbol kinds emitted by the bounded extractor.
+///
+/// The set is closed: [`search_symbols`] refuses an unknown kind instead of
+/// silently returning nothing (a typo must be visible, not an empty result).
+pub const SYMBOL_KINDS: &[&str] = &[
+    "function",
+    "struct",
+    "enum",
+    "trait",
+    "union",
+    "type",
+    "const",
+    "static",
+    "module",
+    "macro",
+    "class",
+    "interface",
+];
 
 /// FTS5 module name used by the probe and schema.
 pub const FTS5_MODULE: &str = "fts5";
@@ -123,6 +151,19 @@ CREATE TABLE IF NOT EXISTS repo_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_repo_chunks_file
     ON repo_chunks (file_id, chunk_index);
+CREATE TABLE IF NOT EXISTS repo_symbols (
+    id        INTEGER PRIMARY KEY,
+    file_id   INTEGER NOT NULL REFERENCES repo_files (id) ON DELETE CASCADE,
+    name      TEXT NOT NULL CHECK (length(name) > 0),
+    kind      TEXT NOT NULL CHECK (length(kind) > 0),
+    line      INTEGER NOT NULL CHECK (line >= 1),
+    signature TEXT NOT NULL,
+    UNIQUE (file_id, name, kind, line)
+);
+CREATE INDEX IF NOT EXISTS idx_repo_symbols_name
+    ON repo_symbols (name, kind);
+CREATE INDEX IF NOT EXISTS idx_repo_symbols_file
+    ON repo_symbols (file_id);
 "#;
 
 /// Down migration paired with [`SCHEMA_V26`].
@@ -131,6 +172,9 @@ DROP TRIGGER IF EXISTS repo_chunks_au;
 DROP TRIGGER IF EXISTS repo_chunks_ad;
 DROP TRIGGER IF EXISTS repo_chunks_ai;
 DROP TABLE IF EXISTS repo_chunks_fts;
+DROP INDEX IF EXISTS idx_repo_symbols_file;
+DROP INDEX IF EXISTS idx_repo_symbols_name;
+DROP TABLE IF EXISTS repo_symbols;
 DROP INDEX IF EXISTS idx_repo_chunks_file;
 DROP TABLE IF EXISTS repo_chunks;
 DROP INDEX IF EXISTS idx_repo_files_workspace;
@@ -300,6 +344,8 @@ pub struct IndexReport {
     pub files_indexed: usize,
     /// Number of chunks written.
     pub chunks_indexed: usize,
+    /// Number of symbol declarations written to `repo_symbols`.
+    pub symbols_indexed: usize,
     /// Number of text bytes indexed.
     pub bytes_indexed: u64,
     /// Files skipped because they exceed [`MAX_FILE_BYTES`].
@@ -388,6 +434,21 @@ pub struct SearchHit {
     pub score: f64,
     /// FTS5 snippet around the match.
     pub snippet: String,
+}
+
+/// One symbol declaration returned by [`search_symbols`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolHit {
+    /// Declared symbol name (no namespace/qualification).
+    pub name: String,
+    /// One of [`SYMBOL_KINDS`].
+    pub kind: String,
+    /// Workspace-relative path of the declaring file.
+    pub rel_path: String,
+    /// 1-based line of the declaration.
+    pub line: usize,
+    /// Bounded declaration text (whitespace-collapsed, comments/strings removed).
+    pub signature: String,
 }
 
 /// A canonicalized workspace root. All path helpers hang off this value.
@@ -945,6 +1006,16 @@ pub fn index_workspace_with(
 
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| RepoIndexError::sqlite("starting repository index transaction", error))?;
+    // `repo_symbols.file_id` is declared ON DELETE CASCADE, but the index must
+    // not depend on `PRAGMA foreign_keys` being enabled on the caller's
+    // connection: delete the child rows explicitly, oldest relation first.
+    transaction
+        .execute(
+            "DELETE FROM repo_symbols
+             WHERE file_id IN (SELECT id FROM repo_files WHERE workspace_id = ?1)",
+            params![workspace_id],
+        )
+        .map_err(|error| RepoIndexError::sqlite("clearing stale repository symbols", error))?;
     transaction
         .execute(
             "DELETE FROM repo_chunks
@@ -973,6 +1044,12 @@ pub fn index_workspace_with(
                  VALUES (?1, ?2, ?3, ?4, ?5)",
             )
             .map_err(|error| RepoIndexError::sqlite("preparing repository chunk insert", error))?;
+        let mut insert_symbol = transaction
+            .prepare(
+                "INSERT INTO repo_symbols (file_id, name, kind, line, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(|error| RepoIndexError::sqlite("preparing repository symbol insert", error))?;
         let indexed_at = now_millis();
 
         for candidate in &walk.candidates {
@@ -1012,6 +1089,18 @@ pub fn index_workspace_with(
                     ])
                     .map_err(|error| RepoIndexError::sqlite("inserting repository chunk", error))?;
                 report.chunks_indexed += 1;
+            }
+            for symbol in extract_symbols(&candidate.rel_path, &text) {
+                insert_symbol
+                    .execute(params![
+                        file_id,
+                        symbol.name,
+                        symbol.kind,
+                        i64::try_from(symbol.line).unwrap_or(i64::MAX),
+                        symbol.signature,
+                    ])
+                    .map_err(|error| RepoIndexError::sqlite("inserting repository symbol", error))?;
+                report.symbols_indexed += 1;
             }
             report.files_indexed += 1;
             report.bytes_indexed += u64::try_from(text.len()).unwrap_or(0);
@@ -1102,6 +1191,127 @@ pub fn search_workspace(
 ) -> Result<Vec<SearchHit>, RepoIndexError> {
     let workspace = Workspace::open(root)?;
     search_chunks(conn, workspace.id(), query, limit)
+}
+
+/// Searches the indexed symbol table for one workspace.
+///
+/// `query` matches a symbol name case-insensitively as a substring; an empty
+/// query matches every symbol (useful with a `kind` filter). `kind` is an exact,
+/// closed filter: it must be one of [`SYMBOL_KINDS`] or the call is refused as
+/// [`RepoIndexError::InvalidQuery`] (a typo must be visible, not an empty
+/// result). `limit` must be between `1` and [`MAX_SYMBOL_RESULTS`]; the hard cap
+/// is never raised.
+///
+/// Results are deterministic: exact-name matches first, then prefix matches,
+/// then substring matches, each ordered by name, path, and line. The stored
+/// signature is bounded by [`MAX_SYMBOL_SIGNATURE_BYTES`].
+///
+/// # Errors
+/// [`RepoIndexError::InvalidQuery`] for an empty workspace id, an oversized or
+/// empty-after-trim query, or an unknown kind; [`RepoIndexError::InvalidLimit`];
+/// [`RepoIndexError::SchemaMismatch`] for a corrupt line number; and contextual
+/// SQLite errors.
+pub fn search_symbols(
+    conn: &Connection,
+    workspace_id: &str,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SymbolHit>, RepoIndexError> {
+    if workspace_id.is_empty() {
+        return Err(RepoIndexError::InvalidQuery(
+            "workspace_id is empty".to_owned(),
+        ));
+    }
+    let query = query.trim();
+    if query.len() > MAX_SYMBOL_QUERY_BYTES {
+        return Err(RepoIndexError::InvalidQuery(format!(
+            "symbol query exceeds {MAX_SYMBOL_QUERY_BYTES} bytes"
+        )));
+    }
+    if query.is_empty() && kind.is_none() {
+        return Err(RepoIndexError::InvalidQuery(
+            "symbol query and kind are both empty".to_owned(),
+        ));
+    }
+    if let Some(kind) = kind {
+        if !SYMBOL_KINDS.contains(&kind) {
+            return Err(RepoIndexError::InvalidQuery(format!(
+                "unknown symbol kind {kind:?}; expected one of {SYMBOL_KINDS:?}"
+            )));
+        }
+    }
+    validate_limit("symbol results", limit, MAX_SYMBOL_RESULTS)?;
+    ensure_symbols_table(conn)?;
+
+    let sql = "SELECT rs.name, rs.kind, rf.rel_path, rs.line, rs.signature
+               FROM repo_symbols rs
+               JOIN repo_files rf ON rf.id = rs.file_id
+               WHERE rf.workspace_id = ?1
+                 AND (?2 = '' OR instr(lower(rs.name), lower(?2)) > 0)
+                 AND (?3 IS NULL OR rs.kind = ?3)
+               ORDER BY CASE
+                          WHEN ?2 <> '' AND lower(rs.name) = lower(?2) THEN 0
+                          WHEN ?2 <> '' AND substr(lower(rs.name), 1, length(?2)) = lower(?2)
+                              THEN 1
+                          ELSE 2
+                        END,
+                        rs.name ASC, rf.rel_path ASC, rs.line ASC
+               LIMIT ?4";
+    let mut statement = conn
+        .prepare(sql)
+        .map_err(|error| RepoIndexError::sqlite("preparing repository symbol search", error))?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = statement
+        .query_map(params![workspace_id, query, kind, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|error| RepoIndexError::sqlite("querying repository symbols", error))?;
+
+    let mut hits = Vec::new();
+    for row in rows {
+        let (name, kind, rel_path, line, signature) =
+            row.map_err(|error| RepoIndexError::sqlite("reading repository symbol", error))?;
+        let line = u64::try_from(line)
+            .ok()
+            .and_then(|line| usize::try_from(line).ok())
+            .filter(|line| *line >= 1)
+            .ok_or_else(|| {
+                RepoIndexError::SchemaMismatch(format!(
+                    "repo_symbols row for {rel_path:?} has an invalid line {line}"
+                ))
+            })?;
+        hits.push(SymbolHit {
+            name,
+            kind,
+            rel_path,
+            line,
+            signature,
+        });
+    }
+    Ok(hits)
+}
+
+/// Convenience wrapper around [`search_symbols`] that derives the workspace id
+/// from `root`.
+///
+/// # Errors
+/// The same errors as [`Workspace::open`] and [`search_symbols`].
+pub fn search_workspace_symbols(
+    conn: &Connection,
+    root: &Path,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SymbolHit>, RepoIndexError> {
+    let workspace = Workspace::open(root)?;
+    search_symbols(conn, workspace.id(), query, kind, limit)
 }
 
 /// Quotes `text` as a single FTS5 phrase, so user input is matched literally
@@ -1493,6 +1703,11 @@ fn verify_schema(conn: &Connection) -> Result<(), RepoIndexError> {
             "content",
         ],
     )?;
+    verify_table(
+        conn,
+        "repo_symbols",
+        &["id", "file_id", "name", "kind", "line", "signature"],
+    )?;
     let definition: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repo_chunks_fts'",
@@ -1512,6 +1727,22 @@ fn verify_schema(conn: &Connection) -> Result<(), RepoIndexError> {
         }
         Some(_) => Ok(()),
     }
+}
+
+/// Creates/upgrades the symbol table on a database migrated before symbol
+/// indexing existed.
+///
+/// [`SCHEMA_V26`] is idempotent (`IF NOT EXISTS`), so re-executing it is the
+/// supported lazy upgrade path. Only the symbol table is verified here; FTS5
+/// availability is irrelevant to a symbol search.
+fn ensure_symbols_table(conn: &Connection) -> Result<(), RepoIndexError> {
+    conn.execute_batch(SCHEMA_V26)
+        .map_err(|error| RepoIndexError::sqlite("creating repository symbol tables", error))?;
+    verify_table(
+        conn,
+        "repo_symbols",
+        &["id", "file_id", "name", "kind", "line", "signature"],
+    )
 }
 
 fn verify_table(
@@ -1644,6 +1875,262 @@ fn chunk_text(text: &str) -> Vec<TextChunk> {
         });
     }
     chunks
+}
+
+// --- bounded symbol extraction ---------------------------------------------
+
+/// Language family understood by [`extract_symbols`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymbolLanguage {
+    Rust,
+    TypeScript,
+    Python,
+    Go,
+}
+
+/// One declaration extracted from a file before it is written to `repo_symbols`.
+#[derive(Debug)]
+struct ExtractedSymbol {
+    name: String,
+    kind: &'static str,
+    line: usize,
+    signature: String,
+}
+
+/// Compiled, statically cached declaration matchers.
+struct SymbolMatchers {
+    rust: Regex,
+    typescript_decl: Regex,
+    typescript_arrow: Regex,
+    python: Regex,
+    go_function: Regex,
+    go_type: Regex,
+}
+
+fn symbol_matchers() -> &'static SymbolMatchers {
+    static MATCHERS: OnceLock<SymbolMatchers> = OnceLock::new();
+    MATCHERS.get_or_init(|| SymbolMatchers {
+        rust: Regex::new(
+            r#"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|default|extern(?:\s+"[^"]*")?)\s+)*(?:const\s+)?(?P<kind>fn|struct|enum|trait|union|type|mod|static|const|macro_rules!)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"#,
+        )
+        .expect("static Rust symbol matcher is valid"),
+        typescript_decl: Regex::new(
+            r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?P<kind>function|class|interface|type|enum|namespace)\s+\*?\s*(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)",
+        )
+        .expect("static TypeScript declaration matcher is valid"),
+        typescript_arrow: Regex::new(
+            r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>)",
+        )
+        .expect("static TypeScript arrow-function matcher is valid"),
+        python: Regex::new(
+            r"^\s*(?:async\s+)?(?P<kind>def|class)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("static Python symbol matcher is valid"),
+        go_function: Regex::new(
+            r"^\s*func\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)",
+        )
+        .expect("static Go function matcher is valid"),
+        go_type: Regex::new(
+            r"^\s*type\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<kind>struct|interface)\b",
+        )
+        .expect("static Go type matcher is valid"),
+    })
+}
+
+fn language_for(rel_path: &str) -> Option<SymbolLanguage> {
+    let (_, extension) = rel_path.rsplit_once('.')?;
+    match extension.to_ascii_lowercase().as_str() {
+        "rs" => Some(SymbolLanguage::Rust),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => Some(SymbolLanguage::TypeScript),
+        "py" => Some(SymbolLanguage::Python),
+        "go" => Some(SymbolLanguage::Go),
+        _ => None,
+    }
+}
+
+/// Extracts bounded symbol declarations from one indexed file.
+///
+/// This is a conservative line-oriented scanner, not a full parser: it strips
+/// comments and double-quoted strings, then matches a declaration keyword at
+/// the start of the remaining code. That keeps false positives low (a `fn`
+/// inside a comment or string never matches) while remaining dependency-free
+/// and bounded by [`MAX_SYMBOLS_PER_FILE`]. Unsupported extensions yield no
+/// symbols rather than a guess.
+fn extract_symbols(rel_path: &str, text: &str) -> Vec<ExtractedSymbol> {
+    let Some(language) = language_for(rel_path) else {
+        return Vec::new();
+    };
+    let matchers = symbol_matchers();
+    let mut block_comment_depth = 0usize;
+    let mut symbols = Vec::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        if symbols.len() >= MAX_SYMBOLS_PER_FILE {
+            break;
+        }
+        let code = strip_code_noise(raw_line, &mut block_comment_depth);
+        if code.trim().is_empty() {
+            continue;
+        }
+        let Some((name, kind)) = match_declaration(language, &code, matchers) else {
+            continue;
+        };
+        symbols.push(ExtractedSymbol {
+            name,
+            kind,
+            line: index + 1,
+            signature: bounded_signature(&code),
+        });
+    }
+    symbols
+}
+
+/// Removes line comments, block comments, and double-quoted strings while
+/// preserving byte positions for the characters that remain code.
+///
+/// Single quotes are deliberately not treated as strings: Rust lifetimes
+/// (`'a`) and TypeScript string literals both use them, and mis-tracking one
+/// would silently delete real declarations. A declaration keyword still has to
+/// start the code line, so an unmatched quote cannot manufacture a symbol.
+fn strip_code_noise(line: &str, block_comment_depth: &mut usize) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if *block_comment_depth > 0 {
+            match character {
+                '/' if characters.peek() == Some(&'*') => {
+                    characters.next();
+                    *block_comment_depth += 1;
+                }
+                '*' if characters.peek() == Some(&'/') => {
+                    characters.next();
+                    *block_comment_depth -= 1;
+                }
+                _ => {}
+            }
+            output.push(' ');
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            output.push(' ');
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                output.push(' ');
+            }
+            '/' if characters.peek() == Some(&'/') => break,
+            '/' if characters.peek() == Some(&'*') => {
+                characters.next();
+                *block_comment_depth += 1;
+                output.push(' ');
+            }
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
+fn match_declaration(
+    language: SymbolLanguage,
+    code: &str,
+    matchers: &SymbolMatchers,
+) -> Option<(String, &'static str)> {
+    match language {
+        SymbolLanguage::Rust => {
+            let captures = matchers.rust.captures(code)?;
+            let keyword = captures.name("kind")?.as_str();
+            let kind = match keyword {
+                "fn" => "function",
+                "struct" => "struct",
+                "enum" => "enum",
+                "trait" => "trait",
+                "union" => "union",
+                "type" => "type",
+                "mod" => "module",
+                "static" => "static",
+                "macro_rules!" => "macro",
+                _ => return None,
+            };
+            Some((captures.name("name")?.as_str().to_owned(), kind))
+        }
+        SymbolLanguage::TypeScript => {
+            if let Some(captures) = matchers.typescript_decl.captures(code) {
+                let kind = match captures.name("kind")?.as_str() {
+                    "function" => "function",
+                    "class" => "class",
+                    "interface" => "interface",
+                    "type" => "type",
+                    "enum" => "enum",
+                    "namespace" => "module",
+                    _ => return None,
+                };
+                return Some((captures.name("name")?.as_str().to_owned(), kind));
+            }
+            let captures = matchers.typescript_arrow.captures(code)?;
+            Some((captures.name("name")?.as_str().to_owned(), "function"))
+        }
+        SymbolLanguage::Python => {
+            let captures = matchers.python.captures(code)?;
+            let kind = match captures.name("kind")?.as_str() {
+                "def" => "function",
+                "class" => "class",
+                _ => return None,
+            };
+            Some((captures.name("name")?.as_str().to_owned(), kind))
+        }
+        SymbolLanguage::Go => {
+            if let Some(captures) = matchers.go_function.captures(code) {
+                return Some((captures.name("name")?.as_str().to_owned(), "function"));
+            }
+            let captures = matchers.go_type.captures(code)?;
+            let kind = match captures.name("kind")?.as_str() {
+                "struct" => "struct",
+                "interface" => "interface",
+                _ => return None,
+            };
+            Some((captures.name("name")?.as_str().to_owned(), kind))
+        }
+    }
+}
+
+/// Builds a bounded, whitespace-collapsed signature from the declaration line.
+///
+/// The body is cut at the first `{` or `;` when present; the result is capped at
+/// [`MAX_SYMBOL_SIGNATURE_BYTES`] bytes (including the trailing `...` marker).
+fn bounded_signature(code: &str) -> String {
+    let trimmed = code.trim();
+    let cut = trimmed
+        .find('{')
+        .into_iter()
+        .chain(trimmed.find(';'))
+        .min()
+        .unwrap_or(trimmed.len());
+    let head = trimmed[..cut].trim();
+    let mut collapsed = String::with_capacity(head.len().min(MAX_SYMBOL_SIGNATURE_BYTES));
+    for token in head.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(token);
+    }
+    if collapsed.len() <= MAX_SYMBOL_SIGNATURE_BYTES {
+        return collapsed;
+    }
+    let mut boundary = MAX_SYMBOL_SIGNATURE_BYTES.saturating_sub(3);
+    while boundary > 0 && !collapsed.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}...", &collapsed[..boundary])
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

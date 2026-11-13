@@ -39,6 +39,27 @@ use crate::db::Database;
 /// concurrent call for the same run took it first (bounded retry, never a loop).
 const CHECKPOINT_SEQ_ATTEMPTS: u8 = 3;
 
+/// Maximum workspace root entries listed by `harness_diagnose` (names only).
+const MAX_DIAGNOSE_TOP_LEVEL: usize = 32;
+
+/// One row per agent tier: whether `harness_diagnose` is on its allowlist.
+///
+/// Diagnostics availability is a capability fact, so it is reported from the
+/// same frozen registry the executor uses rather than restated by hand.
+fn diagnostics_availability() -> Vec<serde_json::Value> {
+    use hiverouter_tools::tool::{AgentTier, ToolId, ToolRegistry};
+    let registry = ToolRegistry::standard();
+    AgentTier::all()
+        .into_iter()
+        .map(|tier| {
+            serde_json::json!({
+                "tier": tier.label(),
+                "granted": registry.is_allowed(tier, ToolId::HarnessDiagnose),
+            })
+        })
+        .collect()
+}
+
 /// Wired tools capabilities for the local server.
 #[derive(Debug)]
 pub struct ToolsBridge {
@@ -1196,12 +1217,14 @@ impl ToolsBridge {
 
     /// Secret-free self-diagnosis summary for the `harness_diagnose` tool.
     ///
-    /// `scope` selects one section (`all`, `health`, `logs`, `refusals`); an
-    /// unknown scope is a named schema refusal rather than a silent default.
-    /// `limit` bounds the recent-refusal rows (1..=50). The payload contains no
-    /// key, bearer token, file body, or caller-supplied path: log truth is
-    /// metadata only (name, size, mtime, newest audit file) and refusals carry
-    /// only timestamp/code/run/tool/permission class.
+    /// `scope` selects one section (`all`, `health`, `workspace`, `logs`,
+    /// `refusals`); an unknown scope is a named schema refusal rather than a
+    /// silent default. `limit` bounds the recent-refusal rows (1..=50). The
+    /// payload contains no key, bearer token, file body, or caller-supplied
+    /// path: log truth is metadata only (name, size, mtime, newest audit file),
+    /// refusals carry only timestamp/code/run/tool/permission class, and the
+    /// workspace section names the jail root plus a bounded, sorted sample of
+    /// root entries so a model that guessed a wrong path can see what exists.
     ///
     /// # Errors
     /// `E_SCHEMA_INVALID` for an unknown scope, `E_INTERNAL_ERROR` when the
@@ -1212,7 +1235,7 @@ impl ToolsBridge {
         limit: usize,
     ) -> Result<serde_json::Value, Refusal> {
         let scope = match scope {
-            "all" | "health" | "logs" | "refusals" => scope,
+            "all" | "health" | "workspace" | "logs" | "refusals" => scope,
             _ => {
                 return Err(Refusal::SchemaInvalid);
             }
@@ -1235,6 +1258,7 @@ impl ToolsBridge {
             .map(|scan| scan.recent.clone())
             .unwrap_or_default();
         let include_health = matches!(scope, "all" | "health");
+        let include_workspace = matches!(scope, "all" | "workspace");
         let include_logs = matches!(scope, "all" | "logs");
         let include_refusals = matches!(scope, "all" | "refusals");
         Ok(serde_json::json!({
@@ -1246,10 +1270,32 @@ impl ToolsBridge {
                     "db_ok": db_ok,
                     "provider_key_present": key_present,
                     "side_effects_enabled": self.side_effects_enabled,
+                    "workspace_root": self.workspace_root.display().to_string(),
+                    "jail_available": self.jail.is_some(),
+                    "jail_error": self.jail_error.clone(),
                     "data_dir": self.data_dir.as_ref().map(|path| path.display().to_string()),
                     "audit_log_dir": audit_dir.as_ref().map(|path| path.display().to_string()),
                     "tool_count": census.tool_count,
                     "grant_count": census.grant_count(),
+                })
+            } else {
+                serde_json::Value::Null
+            },
+            "workspace": if include_workspace {
+                serde_json::json!({
+                    "root": self.workspace_root.display().to_string(),
+                    "jail_available": self.jail.is_some(),
+                    "jail_error": self.jail_error.clone(),
+                    "path_rules": {
+                        "relative": true,
+                        "separator": "/",
+                        "escapes_refused": ["../", "absolute paths", "drive letters", "symlinks"],
+                        "denied": ["data directory", "database and SQLite sidecars"],
+                        "hint": "use fs_glob or file_list to discover a path; file_read needs an existing file, not a directory",
+                    },
+                    "top_level": self.workspace_top_level(MAX_DIAGNOSE_TOP_LEVEL),
+                    "top_level_limit": MAX_DIAGNOSE_TOP_LEVEL,
+                    "diagnostics_by_tier": diagnostics_availability(),
                 })
             } else {
                 serde_json::Value::Null
@@ -1274,6 +1320,33 @@ impl ToolsBridge {
                 serde_json::Value::Null
             },
         }))
+    }
+
+    /// Sorted, bounded names of the workspace root entries for path diagnosis.
+    ///
+    /// Only names (directories suffixed with `/`) — never file bodies, sizes or
+    /// absolute paths. An unavailable jail yields an empty list rather than an
+    /// error: the caller already reports `jail_available`.
+    fn workspace_top_level(&self, limit: usize) -> Vec<String> {
+        let Some(jail) = self.jail.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(entries) = jail.list(None) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .map(|entry| {
+                if entry.is_dir {
+                    format!("{}/", entry.name)
+                } else {
+                    entry.name
+                }
+            })
+            .collect();
+        names.sort();
+        names.truncate(limit);
+        names
     }
 
     /// Contract event for an approval resolution (`approve`/`deny` echo).
@@ -2052,6 +2125,79 @@ mod tests {
                 .expect("recent")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn harness_diagnose_reports_workspace_paths_and_diagnostics_grants() {
+        let (_temp, _data, _db, bridge) = seeded_data_bridge();
+
+        let value = bridge
+            .harness_diagnose("workspace", 5)
+            .expect("workspace scope");
+        assert!(value["health"].is_null(), "a scoped call returns only its section");
+        assert!(value["logs"].is_null());
+        assert!(value["refusals"].is_null());
+
+        let workspace = &value["workspace"];
+        assert_eq!(
+            workspace["root"].as_str().expect("root"),
+            bridge.workspace_root().display().to_string()
+        );
+        assert_eq!(workspace["jail_available"], true);
+        assert!(workspace["jail_error"].is_null());
+
+        let top_level: Vec<&str> = workspace["top_level"]
+            .as_array()
+            .expect("top level")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            top_level.contains(&"notes-legal.txt"),
+            "a real root entry must be discoverable: {top_level:?}"
+        );
+        assert!(top_level.len() <= MAX_DIAGNOSE_TOP_LEVEL);
+        let mut sorted = top_level.clone();
+        sorted.sort_unstable();
+        assert_eq!(top_level, sorted, "the listing is deterministic");
+
+        let rules = &workspace["path_rules"];
+        assert_eq!(rules["relative"], true);
+        assert!(
+            rules["hint"]
+                .as_str()
+                .expect("hint")
+                .contains("fs_glob"),
+            "the path hint names the discovery tool"
+        );
+
+        // Tier availability is reported from the frozen registry, not restated.
+        let registry = hiverouter_tools::tool::ToolRegistry::standard();
+        let rows = workspace["diagnostics_by_tier"]
+            .as_array()
+            .expect("diagnostics_by_tier");
+        assert_eq!(rows.len(), hiverouter_tools::AgentTier::all().len());
+        for row in rows {
+            let label = row["tier"].as_str().expect("tier");
+            let tier = hiverouter_tools::AgentTier::all()
+                .into_iter()
+                .find(|tier| tier.label() == label)
+                .expect("known tier");
+            assert_eq!(
+                row["granted"].as_bool().expect("granted"),
+                registry.is_allowed(tier, hiverouter_tools::ToolId::HarnessDiagnose),
+                "tier {label} availability must match the registry"
+            );
+        }
+
+        // `all` keeps every section, and no file body is echoed into it.
+        let all = bridge.harness_diagnose("all", 5).expect("all scope");
+        assert!(!all["workspace"].is_null());
+        assert!(!all["health"].is_null());
+        assert!(
+            !all.to_string().contains("legal workspace file"),
+            "path diagnostics must name entries, never read their contents"
         );
     }
 

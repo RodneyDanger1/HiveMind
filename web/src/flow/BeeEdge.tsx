@@ -35,6 +35,18 @@ export function BeeEdge(props: EdgeProps) {
     CSS.supports('offset-path', 'path("M 0 0 L 1 1")');
   return (
     <>
+      {/* A wide, low-opacity honey wash under the hairline route: gives the
+          edge a lit trail without a filter or a second animated layer. */}
+      <path
+        className="bee-edge-glow"
+        d={path}
+        fill="none"
+        stroke={broken ? 'var(--color-signal)' : 'var(--color-honey-300)'}
+        strokeWidth="5"
+        strokeLinecap="round"
+        opacity="0.22"
+        pointerEvents="none"
+      />
       <BaseEdge
         id={props.id}
         path={path}
@@ -48,6 +60,19 @@ export function BeeEdge(props: EdgeProps) {
             : `${broken ? 'bee-dash-broken' : 'bee-dash'} 2.4s linear infinite`,
         }}
       />
+      {/* Pollen landing ring at the receiving end, pointing the route in. */}
+      <EdgeLabelRenderer>
+        <div
+          className="bee-edge-landing"
+          style={{
+            position: 'absolute',
+            transform: `translate(-50%, -50%) translate(${props.targetX}px, ${props.targetY}px)`,
+            pointerEvents: 'none',
+            color: broken ? 'var(--color-signal)' : 'var(--color-honey-500)',
+          }}
+          aria-hidden="true"
+        />
+      </EdgeLabelRenderer>
       {reduced || !supportsOffsetPath ? (
         <EdgeLabelRenderer>
           <div
@@ -92,12 +117,60 @@ export function BeeEdge(props: EdgeProps) {
 
 function BeeGlyph() {
   return (
-    <svg width="18" height="18" viewBox="0 0 18 18">
-      <ellipse cx="9" cy="9" rx="5" ry="3.2" fill="currentColor" />
-      <path d="M3 9h12M5.5 6.5h7M5.5 11.5h7" stroke="var(--color-honey-300)" strokeWidth="1.1" />
+    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      {/* Wings sit behind the body and beat a few degrees inside their frame. */}
+      <g className="bee-wings">
+        <g transform="rotate(-18 9.4 6.5)">
+          <ellipse
+            className="bee-wing"
+            cx="9.4"
+            cy="6.5"
+            rx="3.3"
+            ry="1.8"
+            fill="var(--color-honey-100)"
+            stroke="var(--color-ink-800)"
+            strokeWidth="0.55"
+            opacity="0.92"
+          />
+        </g>
+        <g transform="rotate(-8 11 5.7)">
+          <ellipse
+            className="bee-wing bee-wing-far"
+            cx="11"
+            cy="5.7"
+            rx="2.9"
+            ry="1.5"
+            fill="var(--color-honey-200)"
+            stroke="var(--color-ink-800)"
+            strokeWidth="0.45"
+            opacity="0.7"
+          />
+        </g>
+      </g>
+      <path d="M4.4 10.1 2.6 10" stroke="var(--color-ink-800)" strokeWidth="1.1" strokeLinecap="round" />
+      <ellipse
+        cx="10"
+        cy="10"
+        rx="5.4"
+        ry="3.5"
+        fill="var(--color-honey-400)"
+        stroke="var(--color-ink-800)"
+        strokeWidth="0.7"
+      />
       <path
-        d="M7 5.5C5.5 3.7 3.6 3.4 2.5 4.2c1.4.4 2.2 1 3.8 1.9ZM11 5.5c1.5-1.8 3.4-2.1 4.5-1.3-1.4.4-2.2 1-3.8 1.9Z"
-        fill="var(--color-honey-100)"
+        d="M7.6 7.2v5.6M10 6.9v6.2M12.4 7.2v5.6"
+        stroke="var(--color-ink-800)"
+        strokeWidth="1"
+        strokeLinecap="round"
+        opacity="0.7"
+      />
+      <circle cx="15.2" cy="10" r="1.9" fill="var(--color-ink-800)" />
+      <path
+        d="M15.9 8.7c.8-.8 1.7-1.1 2.5-.9M16 11.2c.8.6 1.7.8 2.4.6"
+        fill="none"
+        stroke="var(--color-ink-800)"
+        strokeWidth="0.8"
+        strokeLinecap="round"
       />
     </svg>
   );

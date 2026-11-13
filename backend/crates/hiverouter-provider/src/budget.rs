@@ -23,10 +23,10 @@ use crate::error::ProviderError;
 use crate::pricing::PricingTable;
 
 /// B1: run cost cap, USD per run (PROPOSED-POLICY).
-pub const RUN_COST_CAP_USD_CENTS: i64 = 50;
+pub const RUN_COST_CAP_USD_CENTS: i64 = 100;
 
 /// B2: combined prompt+completion token budget per run (PROPOSED-POLICY).
-pub const TOKEN_BUDGET_COMBINED: u64 = 800_000;
+pub const TOKEN_BUDGET_COMBINED: u64 = 2_000_000;
 
 /// B3: provider call cap per run, including retries (PROPOSED-POLICY).
 /// Maximum provider calls per run. The accepted plan cap is 40 nodes; the
@@ -827,8 +827,8 @@ mod tests {
     #[test]
     fn defaults_match_blueprint_policy_values() {
         let limits = BudgetLimits::default();
-        assert_eq!(limits.run_cost_cap_usd, Decimal::from_str("0.50").unwrap());
-        assert_eq!(limits.token_budget_combined, 800_000);
+        assert_eq!(limits.run_cost_cap_usd, Decimal::from_str("1.00").unwrap());
+        assert_eq!(limits.token_budget_combined, 2_000_000);
         assert_eq!(limits.call_cap, 128);
         assert_eq!(limits.max_attempts, 3);
         assert_eq!(MAX_SPAWN_DEPTH, 3);

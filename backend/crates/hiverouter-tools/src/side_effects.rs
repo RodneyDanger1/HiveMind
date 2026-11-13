@@ -358,10 +358,12 @@ fn preflight_shell_exec(
             ),
         ));
     }
-    // Command-interpreter escape forms are refused before the grant can be
-    // consumed: direct argv is not shell-interpreted, but a mistaken /c-style
-    // launch must never become a command string.
-    crate::shell::validate_arguments(&spec.args)?;
+    // Command-interpreter escape forms and the per-command argument policy are
+    // refused before the grant can be consumed: direct argv is not
+    // shell-interpreted, but a mistaken /c-style launch, a re-pointing flag
+    // (`git -C`, `git --git-dir`), or a command outside its pinned shape must
+    // never reach the commit.
+    policy.validate_invocation(program, &spec.args)?;
     // cwd must already resolve inside the jail and be a directory (the child
     // cannot be spawned for a doomed cwd after consent is consumed).
     if let Some(cwd) = spec.cwd.as_deref() {
@@ -1327,6 +1329,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shell_preflight_refuses_per_command_denied_args() {
+        let (_temp, jail, _conn, _gate, _run) = seeded();
+        let policy = ShellPolicy::conservative_default();
+        let attempts: [Vec<&str>; 3] = [
+            vec!["-C", "."],
+            vec!["--git-dir", "outside"],
+            vec!["--upload-pack=evil"],
+        ];
+        for arguments in attempts {
+            let error = preflight_side_effect(
+                &jail,
+                &registry(),
+                &policy,
+                AgentTier::WorkerAgent,
+                "shell_exec",
+                &serde_json::json!({
+                    "program": "git.exe",
+                    "args": arguments,
+                }),
+                None,
+            )
+            .expect_err(&format!("{arguments:?}"));
+            assert_eq!(error.code(), "E_TOOL_NOT_ALLOWED", "{arguments:?}");
+            assert!(
+                error.detail().contains("policy-denied prefix"),
+                "{arguments:?}: {error}"
+            );
+        }
+    }
+
+    // Execution needs the Windows Job Object backend; on other hosts the commit
+    // refuses by name (E_SANDBOX_UNAVAILABLE), so the execution arm is Windows-only.
+    #[cfg(windows)]
     #[tokio::test]
     async fn shell_commit_runs_allowlisted_program_once_after_grant() {
         let (_temp, jail, conn, gate, run) = seeded();

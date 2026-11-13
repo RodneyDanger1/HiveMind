@@ -1027,3 +1027,237 @@
   scale: 1 !important;
 }
 [data-reduced-motion="true"] .guide-section { animation-delay: 0ms !important; }
+
+/* ------------------------------------------------------------------------- */
+/* Hive card finish: comb seam, parent-side socket, role chip, live rail.     */
+/* All static paint except the live rail's opacity pulse (compositor-only).   */
+/* ------------------------------------------------------------------------- */
+.hive-node-seam {
+  position: absolute;
+  inset: 0 10px auto;
+  z-index: 2;
+  height: 1.5px;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--color-honey-400) 72%, transparent) 20%,
+    color-mix(in srgb, var(--color-honey-300) 50%, transparent) 78%,
+    transparent
+  );
+  opacity: 0.85;
+}
+.hive-node-seam-error {
+  background: linear-gradient(90deg, transparent, var(--color-signal) 24%, var(--color-signal) 76%, transparent);
+  opacity: 0.5;
+}
+.hive-node-socket {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  width: 9px;
+  height: 11px;
+  translate: 0 -50%;
+  border: 1px solid color-mix(in srgb, var(--color-honey-600) 52%, transparent);
+  background: color-mix(in srgb, var(--color-honey-300) 26%, transparent);
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  pointer-events: none;
+}
+.hive-node-socket[data-side='left'] { left: 2px; }
+.hive-node-socket[data-side='right'] { right: 2px; }
+.hive-node-live-rail {
+  position: absolute;
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  z-index: 2;
+  height: 2px;
+  pointer-events: none;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-honey-400) 30%,
+    var(--color-honey-300) 68%,
+    transparent
+  );
+  animation: hive-node-live-pulse 2.8s ease-in-out infinite;
+}
+@keyframes hive-node-live-pulse {
+  0%, 100% { opacity: 0.32; }
+  50% { opacity: 0.92; }
+}
+.hive-role-chip {
+  flex: none;
+  max-width: 108px;
+  overflow: hidden;
+  padding: 0 6px;
+  border: 1px solid color-mix(in srgb, var(--color-honey-400) 52%, var(--color-hairline));
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--color-honey-100) 44%, var(--color-panel));
+  color: var(--color-ink-700);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 15px;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.hive-tool-terminal { position: relative; }
+.hive-tool-scan {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 30px;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    transparent,
+    color-mix(in srgb, var(--color-honey-300) 16%, transparent) 72%,
+    transparent
+  );
+  animation: hive-tool-scan-pass 3.8s ease-in-out infinite;
+  will-change: transform;
+}
+@keyframes hive-tool-scan-pass {
+  0% { transform: translateY(-30px); }
+  100% { transform: translateY(150px); }
+}
+
+/* Route finish: a pollen landing ring at the receiving end of the bee edge. */
+.bee-edge-landing {
+  width: 10px;
+  height: 10px;
+}
+.bee-edge-landing::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  opacity: 0.45;
+}
+.bee-edge-landing::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 3px;
+  height: 3px;
+  translate: -50% -50%;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Tab strips: a honey receptor seam under the selected cell, icons lift on   */
+/* hover. Works for every role=tab strip (settings, library, timeline, gallery). */
+/* ------------------------------------------------------------------------- */
+[role='tablist'] [role='tab'] {
+  position: relative;
+}
+[role='tablist'] [role='tab']::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  bottom: -3px;
+  left: 10px;
+  height: 2px;
+  pointer-events: none;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(90deg, transparent, var(--color-honey-500), transparent);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+[role='tablist'] [role='tab'][aria-selected='true']::after { opacity: 1; }
+[role='tablist'] [role='tab'] svg { transition: transform 160ms cubic-bezier(0.22, 0.61, 0.36, 1); }
+[role='tablist'] [role='tab']:hover svg { transform: translateY(-1px); }
+[role='tablist'] [role='tab']:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Help surfaces: numbered comb badges and a comb rule between sections.      */
+/* ------------------------------------------------------------------------- */
+.help-card-hex {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 24px;
+}
+.help-card-index {
+  color: var(--color-ink-800);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+.help-feature-index {
+  flex: none;
+  color: color-mix(in srgb, var(--color-ink-500) 76%, transparent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 16px;
+  letter-spacing: 0.08em;
+}
+.help-divider,
+.guide-divider {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 20px 0 4px;
+}
+.help-divider::before,
+.help-divider::after,
+.guide-divider::before,
+.guide-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--color-hairline), transparent);
+}
+.help-divider span,
+.guide-divider span {
+  width: 11px;
+  height: 13px;
+  background: linear-gradient(160deg, var(--color-honey-200), var(--color-honey-400));
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  opacity: 0.55;
+}
+.guide-divider { margin: 12px 0 2px; }
+.guide-swatch { position: relative; }
+.guide-swatch-glyph {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  color: var(--color-ink-800);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bee-wing,
+  .hive-node-live-rail,
+  .hive-tool-scan {
+    animation: none !important;
+  }
+  .hive-node-live-rail {
+    opacity: 0.65;
+  }
+  .hive-tool-scan { display: none; }
+  [role='tablist'] [role='tab']:hover svg { transform: none !important; }
+  [role='tablist'] [role='tab']::after { transition: none; }
+}
+[data-reduced-motion='true'] .bee-wing,
+[data-reduced-motion='true'] .hive-node-live-rail,
+[data-reduced-motion='true'] .hive-tool-scan {
+  animation: none !important;
+}
+[data-reduced-motion='true'] .hive-node-live-rail { opacity: 0.65; }
+[data-reduced-motion='true'] .hive-tool-scan { display: none; }
+[data-reduced-motion='true'] [role='tablist'] [role='tab']:hover svg { transform: none !important; }
+[data-reduced-motion='true'] [role='tablist'] [role='tab']::after { transition: none; }
+[data-ambient-motion='off'] .bee-wing { animation: none !important; }

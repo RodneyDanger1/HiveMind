@@ -1539,7 +1539,42 @@ export function createUiStore(api: UiApi, options: UiStoreOptions = {}): StoreAp
             dropBufferedToolResultsForRun(event.payload.run_id);
           }
           const run = get().run;
-          if (!run || run.id !== event.payload.run_id) {
+          const streamingThisRun = get().streamingRunId === event.payload.run_id;
+          if (run === null) {
+            // A late client (or a CLI-owned run) can learn the run only from a
+            // status frame. Adopt an active or still-streaming run; never adopt
+            // a stale terminal frame from an older run.
+            if (!isTerminal(event.payload.status) || streamingThisRun) {
+              set({
+                run: {
+                  id: event.payload.run_id,
+                  status: event.payload.status,
+                  errorCode: event.payload.error_code ?? null,
+                },
+                ...(isTerminal(event.payload.status)
+                  ? {
+                      streamingRunId: null,
+                      messages: finalizeStreamingMessages(get().messages, event.payload.run_id),
+                    }
+                  : {}),
+                graphRev: get().graphRev + 1,
+              });
+            }
+            return;
+          }
+          if (run.id !== event.payload.run_id) {
+            // A terminal frame for another run must still close that run's
+            // streaming row: a CLI wait/completion or a fast run switch would
+            // otherwise leave the transcript marked as streaming forever.
+            const finalized = isTerminal(event.payload.status)
+              ? finalizeStreamingMessages(get().messages, event.payload.run_id)
+              : get().messages;
+            if (finalized !== get().messages || streamingThisRun) {
+              set({
+                ...(streamingThisRun ? { streamingRunId: null } : {}),
+                messages: finalized,
+              });
+            }
             return;
           }
           set({
@@ -1551,7 +1586,10 @@ export function createUiStore(api: UiApi, options: UiStoreOptions = {}): StoreAp
             ...(event.payload.error_code === 'E_KEY_MISSING'
               ? { settings: { ...get().settings, keyPresent: false } }
               : {}),
-            streamingRunId: isTerminal(event.payload.status) ? null : get().streamingRunId,
+            streamingRunId:
+              isTerminal(event.payload.status) && streamingThisRun
+                ? null
+                : get().streamingRunId,
             messages: isTerminal(event.payload.status)
               ? finalizeStreamingMessages(get().messages, event.payload.run_id)
               : get().messages,
@@ -1603,12 +1641,17 @@ export function createUiStore(api: UiApi, options: UiStoreOptions = {}): StoreAp
           return;
         }
         case 'REPLY_DONE': {
-          if (get().run !== null && get().run?.id !== event.payload.run_id) {
+          const doneRunId = event.payload.run_id;
+          const streamingThisRun = get().streamingRunId === doneRunId;
+          // Finalize this run's row even if a newer run already owns `run`:
+          // the reply that streamed into this transcript is finished.
+          const finalized = finalizeStreamingMessages(get().messages, doneRunId);
+          if (finalized === get().messages && !streamingThisRun) {
             return;
           }
           set({
-            messages: finalizeStreamingMessages(get().messages, event.payload.run_id),
-            streamingRunId: null,
+            messages: finalized,
+            streamingRunId: streamingThisRun ? null : get().streamingRunId,
           });
           return;
         }

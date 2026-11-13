@@ -3,6 +3,18 @@ import { useState } from 'react';
 import { GuideOverlay } from './GuideOverlay';
 import { useUiStore } from '../state/context';
 import { STRINGS } from '../state/strings';
+import { isRunActive } from '../state/agentState';
+
+/** Visible run state for every screen; a null run is named, never guessed. */
+export function headerRunLabel(
+  replaying: boolean,
+  runStatus: keyof typeof STRINGS.agentStates | null,
+): string {
+  if (replaying) {
+    return STRINGS.states.replay;
+  }
+  return runStatus === null ? 'No run' : STRINGS.agentStates[runStatus];
+}
 
 export type ChatToggleIntent = 'navigate-show' | 'show' | 'hide';
 
@@ -29,6 +41,9 @@ export function Header() {
   const setWorkspaceTab = useUiStore((state) => state.setWorkspaceTab);
   const replaying = useUiStore((state) => state.history.replayGraph !== null);
   const exitHistoryReplay = useUiStore((state) => state.exitHistoryReplay);
+  const runStatus = useUiStore((state) => state.run?.status ?? null);
+  const runLabel = headerRunLabel(replaying, runStatus);
+  const runActive = !replaying && runStatus !== null && isRunActive(runStatus);
   const [searchOpen, setSearchOpen] = useState(false);
   const [guideOpen, setGuideOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -132,7 +147,49 @@ export function Header() {
             <path d="m12.5 12.5 4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
           </svg>
         </button>
+        <span
+          data-testid="header-run-status"
+          data-run-status={replaying ? 'replay' : (runStatus ?? 'none')}
+          title={
+            replaying
+              ? 'Read-only history replay is open; return live to control the current run'
+              : runStatus === null
+                ? 'No run yet — submit a prompt in the chat dock to start one'
+                : `Run status: ${runLabel}`
+          }
+          aria-label={`Run status: ${runLabel}`}
+          className={
+            'type-mono-meta hidden items-center gap-1 rounded-[var(--radius-pill)] border px-2 py-1 sm:flex ' +
+            (replaying
+              ? 'border-ink-500 bg-recessed text-ink-800'
+              : runStatus === null
+                ? 'border-hairline bg-panel text-meta'
+                : runStatus === 'failed'
+                  ? 'border-signal text-signal'
+                  : runActive
+                    ? 'border-honey-500 bg-honey-100 text-ink-900'
+                    : 'border-verify text-verify')
+          }
+        >
+          <span
+            aria-hidden="true"
+            className={
+              'h-1.5 w-1.5 rounded-full ' +
+              (replaying
+                ? 'bg-ink-500'
+                : runStatus === null
+                  ? 'bg-ink-500/40'
+                  : runStatus === 'failed'
+                    ? 'bg-signal'
+                    : runActive
+                      ? 'motion-hive-live-dot bg-honey-600'
+                      : 'bg-verify')
+            }
+          />
+          {runLabel}
+        </span>
         <div
+          title={`Server connection: ${STRINGS.connection[connection]}`}
           className={
             'type-mono-meta rounded-[var(--radius-pill)] border px-2 py-1 max-[640px]:max-w-[110px] truncate ' +
             (connection === 'open'

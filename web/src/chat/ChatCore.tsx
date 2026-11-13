@@ -17,7 +17,9 @@ import {
 } from 'react';
 import { useUiStore, useUiStoreApi } from '../state/context';
 import { STRINGS } from '../state/strings';
-import { isTerminal } from '../state/agentState';
+import { isRunActive, isTerminal } from '../state/agentState';
+import type { AgentState } from '../state/agentState';
+import type { ConnectionStatus } from '../api/client';
 import { useAppReducedMotion } from '../state/useAppReducedMotion';
 import { validatePromptText } from '../api/contract';
 import { clientRefusal } from '../api/refusals';
@@ -25,7 +27,6 @@ import { approvalActionsEnabled } from '../state/approval';
 import {
   approvalActionAriaLabel,
   approvalQueueLabel,
-  clampApprovalIndex,
   formatExpiry,
   networkApprovalTargetKnown,
 } from '../panels/ApprovalOverlay';
@@ -35,7 +36,7 @@ import { DOT_STATES, visualFor } from '../state/agentState';
 import { StateDot } from '../flow/nodes';
 import { APP_VERSION } from '../version';
 import { CONTROL_INTENTS } from '../state/chatIntents';
-import type { ChatMessage, ToastRefusal } from '../state/store';
+import type { ApprovalRecord, ChatMessage, ToastRefusal } from '../state/store';
 import {
   CHAT_HEIGHT_STORAGE_KEY,
   DEFAULT_CHAT_HEIGHT,
@@ -150,6 +151,93 @@ export function visibleChatMessages(messages: readonly ChatMessage[]): readonly 
     : messages;
 }
 
+/** Distance from the transcript bottom that still counts as "following". */
+export const TRANSCRIPT_STICK_THRESHOLD_PX = 48;
+
+export type RunActivityTone = 'offline' | 'planning' | 'live' | 'failed' | 'idle';
+
+export interface RunActivity {
+  readonly label: string;
+  readonly tone: RunActivityTone;
+  /** True only while the run can still produce events (drives the bee/dot). */
+  readonly live: boolean;
+}
+
+/**
+ * One source of truth for the dock status pill. A terminal run status always
+ * wins over a stale `streamingRunId`: after CLI wait/completion the server may
+ * close the run without a final REPLY_DONE, and an operator must never see
+ * "running" (or "N active") for a run that already finished.
+ */
+export function runActivity(input: {
+  readonly connection: ConnectionStatus;
+  readonly runStatus: AgentState | null;
+  readonly streamingRunId: string | null;
+  readonly activeAgents: number;
+}): RunActivity {
+  if (input.connection !== 'open') {
+    return { label: 'offline', tone: 'offline', live: false };
+  }
+  if (input.runStatus !== null && isTerminal(input.runStatus)) {
+    return {
+      label: input.runStatus === 'failed' ? 'failed' : 'idle',
+      tone: input.runStatus === 'failed' ? 'failed' : 'idle',
+      live: false,
+    };
+  }
+  const live =
+    input.streamingRunId !== null ||
+    (input.runStatus !== null && isRunActive(input.runStatus));
+  if (input.runStatus === 'planning') {
+    return { label: 'planning', tone: 'planning', live: true };
+  }
+  if (!live) {
+    return { label: 'idle', tone: 'idle', live: false };
+  }
+  return {
+    label: `${input.activeAgents} active`,
+    tone: 'live',
+    live: true,
+  };
+}
+
+/** True when the scroll position is close enough to the bottom to auto-follow. */
+export function shouldAutoScroll(input: {
+  readonly scrollTop: number;
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
+  readonly threshold?: number;
+}): boolean {
+  const threshold = input.threshold ?? TRANSCRIPT_STICK_THRESHOLD_PX;
+  const distance = input.scrollHeight - input.scrollTop - input.clientHeight;
+  return !Number.isFinite(distance) || distance <= threshold;
+}
+
+/**
+ * Key for the dismissed run-error card. A refusal on the same run with a new
+ * code (or a new run with the same code) must re-open the alert; keying only on
+ * the run id hid the second failure.
+ */
+export function runErrorKey(runId: string | null, errorCode: string | null): string | null {
+  return runId === null || errorCode === null ? null : `${runId}:${errorCode}`;
+}
+
+/**
+ * Index of the approval the operator chose, resolved by identity. Index-only
+ * cursors shift when another approval resolves and can silently move the
+ * Approve button onto a different tool call.
+ */
+export function approvalIndexFor(
+  approvals: readonly Pick<ApprovalRecord, 'approvalId'>[],
+  cursorId: string | null,
+): number {
+  if (cursorId === null || approvals.length === 0) {
+    return 0;
+  }
+  const found = approvals.findIndex((approval) => approval.approvalId === cursorId);
+  return found === -1 ? 0 : found;
+}
+
 /**
  * Finalized rows are identity-stable in the store, so memo stops every REPLY_DELTA
  * from re-rendering (and re-parsing) the entire history. Only the streaming tail
@@ -193,7 +281,7 @@ export function ChatCore() {
   const replaying = useUiStore((state) => state.history.replayGraph !== null);
   const runErrorCode = useUiStore((state) => state.run?.errorCode ?? null);
   const runId = useUiStore((state) => state.run?.id ?? null);
-  const [dismissedErrorRunId, setDismissedErrorRunId] = useState<string | null>(null);
+  const [dismissedErrorKey, setDismissedErrorKey] = useState<string | null>(null);
   const settings = useUiStore((state) => state.settings);
   const probeSettings = useUiStore((state) => state.probeSettings);
   const keyPresent = settings.keyPresent;
@@ -203,9 +291,9 @@ export function ChatCore() {
   const resolveApproval = useUiStore((state) => state.resolveApproval);
   const retryApproval = useUiStore((state) => state.retryApproval);
   const dismissApproval = useUiStore((state) => state.dismissApproval);
-  const [approvalCursor, setApprovalCursor] = useState(0);
+  const [approvalCursorId, setApprovalCursorId] = useState<string | null>(null);
   const [approvalNow, setApprovalNow] = useState(() => Date.now());
-  const approvalIndex = clampApprovalIndex(approvalCursor, approvals.length);
+  const approvalIndex = approvalIndexFor(approvals, approvalCursorId);
   const pendingApproval = approvals[approvalIndex] ?? null;
   const pendingApprovalResolve =
     pendingApproval === null ? undefined : approvalResolve[pendingApproval.approvalId];
@@ -559,20 +647,29 @@ export function ChatCore() {
     ...(namedSession ? { sessionId: namedSession } : {}),
     policy: permissionPolicy,
   };
-  const liveLabel =
-    connection !== 'open'
-      ? 'offline'
-      : runStatus === 'planning'
-        ? 'planning'
-        : streamingRunId !== null || runStatus === 'running' || runStatus === 'thinking'
-          ? `${activeAgents} active`
-          : 'idle';
+  const activity = runActivity({
+    connection,
+    runStatus,
+    streamingRunId,
+    activeAgents,
+  });
+  const liveLabel = activity.label;
+  // A stale streaming id must not outlive a terminal run status (CLI wait
+  // completion without REPLY_DONE). The status row follows the run lifecycle.
+  const showStreaming = streamingRunId !== null && (runStatus === null || isRunActive(runStatus));
+  const canCancel = runStatus !== null && isRunActive(runStatus);
   const runRefusal = runErrorCode === null ? null : clientRefusal(runErrorCode);
+  const errorKey = runErrorKey(runId, runErrorCode);
+  const errorVisible = runRefusal !== null && errorKey !== dismissedErrorKey;
   const reduced = useAppReducedMotion();
   const store = useUiStoreApi();
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  // Auto-follow only while the operator is already at the bottom. Pinning on
+  // every delta yanked the transcript away from anyone reading earlier text.
+  const stickRef = useRef(true);
+  const [scrolledAway, setScrolledAway] = useState(false);
   // Synchronous double-submit guard: the derived `submitting` updates on render,
   // so two fast Enter presses could otherwise both pass the disabled check.
   const inFlightRef = useRef(false);
@@ -599,22 +696,54 @@ export function ChatCore() {
 
   useEffect(() => {
     const node = listRef.current;
-    if (node) {
-      // An empty thread must show its starters from the top. Scrolling an
-      // empty log to its measured height hid the first starter under the
-      // header once the root-control block was added. A pending approval is
-      // the exception: it is a decision the operator must see.
-      node.scrollTop =
-        messages.length === 0 && pendingApproval === null ? 0 : node.scrollHeight;
+    if (!node) return;
+    // An empty thread must show its starters from the top. Scrolling an empty
+    // log to its measured height hid the first starter under the header.
+    if (messages.length === 0 && pendingApproval === null) {
+      node.scrollTop = 0;
+      stickRef.current = true;
+      setScrolledAway(false);
+      return;
     }
-    // A pending approval arrives as a transcript row; bring it into view when
-    // it appears or when the operator pages through the queue.
+    // A pending approval is a decision the operator must see, so it always
+    // wins; ordinary deltas only follow when the transcript is already pinned.
+    if (stickRef.current || pendingApproval !== null) {
+      node.scrollTop = node.scrollHeight;
+    }
   }, [messages, approvals.length, approvalIndex, pendingApproval?.approvalId]);
+
+  const onTranscriptScroll = (): void => {
+    const node = listRef.current;
+    if (node === null) return;
+    const stick = shouldAutoScroll({
+      scrollTop: node.scrollTop,
+      scrollHeight: node.scrollHeight,
+      clientHeight: node.clientHeight,
+    });
+    stickRef.current = stick;
+    setScrolledAway(!stick);
+  };
+
+  const jumpToLatest = (): void => {
+    const node = listRef.current;
+    if (node === null) return;
+    node.scrollTop = node.scrollHeight;
+    stickRef.current = true;
+    setScrolledAway(false);
+  };
 
   const hasApprovalExpiry = approvals.some((approval) => Boolean(approval.expiresAt));
   useEffect(() => {
-    setApprovalCursor((current) => clampApprovalIndex(current, approvals.length));
-  }, [approvals.length]);
+    if (approvals.length === 0) {
+      setApprovalCursorId(null);
+      return;
+    }
+    setApprovalCursorId((current) =>
+      current !== null && approvals.some((approval) => approval.approvalId === current)
+        ? current
+        : null,
+    );
+  }, [approvals]);
   useEffect(() => {
     if (!chat.visible || !hasApprovalExpiry) return undefined;
     const timer = window.setInterval(() => {
@@ -732,7 +861,9 @@ export function ChatCore() {
   };
 
   const dismissRunError = (): void => {
-    setDismissedErrorRunId(runId);
+    // Dismiss exactly the refusal on screen; a later refusal on the same run
+    // (different code) has a different key and reopens the card.
+    setDismissedErrorKey(errorKey);
     const composer = composerRef.current;
     if (composer !== null && !composer.disabled) {
       composer.focus();
@@ -799,12 +930,7 @@ export function ChatCore() {
         >
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <WorkingBee
-              running={
-                streamingRunId !== null ||
-                runStatus === 'running' ||
-                runStatus === 'thinking' ||
-                runStatus === 'planning'
-              }
+              running={activity.live}
             />
             <div className="truncate text-[14px] font-semibold leading-[18px]">{STRINGS.chat.title}</div>
           </div>
@@ -813,15 +939,19 @@ export function ChatCore() {
               className="type-mono-meta flex items-center gap-1 whitespace-nowrap px-1 text-[11px] text-honey-100/80"
               role="status"
               aria-live="polite"
+              data-testid="chat-run-activity"
+              data-run-activity={activity.tone}
             >
               <span
                 className={
                   'h-1.5 w-1.5 rounded-full ' +
-                  (connection !== 'open'
+                  (activity.tone === 'offline'
                     ? 'bg-signal'
-                    : streamingRunId !== null || runStatus === 'running'
+                    : activity.tone === 'live'
                       ? 'motion-hive-live-dot bg-honey-300'
-                      : 'bg-honey-100/70')
+                      : activity.tone === 'failed'
+                        ? 'bg-signal'
+                        : 'bg-honey-100/70')
                 }
               />
               {liveLabel}
@@ -838,10 +968,17 @@ export function ChatCore() {
           </div>
         </header>
 
-        {runRefusal === null || runId === dismissedErrorRunId ? null : (
+        {errorVisible ? (
           <div
             role="alert"
+            data-testid="chat-run-error"
             className="mt-2 flex min-w-0 items-center gap-2 rounded-[var(--radius-sm)] border border-signal bg-ink-900 px-2 py-1 text-canvas"
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                dismissRunError();
+              }
+            }}
           >
             <span className="type-label shrink-0 text-honey-200">RUN REFUSED</span>
             <span className="type-mono-meta shrink-0 text-[10px] text-honey-200">
@@ -872,7 +1009,7 @@ export function ChatCore() {
                 : ''}
             </span>
           </div>
-        )}
+        ) : null}
 
         {hiddenMessageCount > 0 ? (
           <p
@@ -890,6 +1027,7 @@ export function ChatCore() {
           ref={listRef}
           tabIndex={0}
           role="region"
+          onScroll={onTranscriptScroll}
           className="mt-2 min-h-[140px] flex-1 overflow-y-auto rounded-[var(--radius-sm)] bg-panel-alt px-2 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ink-700"
           aria-label="Chat transcript"
         >
@@ -957,7 +1095,7 @@ export function ChatCore() {
               </ul>
             </section>
           ) : null}
-          {streamingRunId ? (
+          {showStreaming ? (
             <div className="type-mono-meta flex items-center gap-2 text-meta" role="status">
               {renderedMessages.some((message) => message.streaming && message.text.length > 0) ? null : (
                 <TypingDots />
@@ -998,7 +1136,7 @@ export function ChatCore() {
                     className="type-mono-meta rounded-[4px] px-1.5 py-0.5 text-[10px] text-ink-700 hover:bg-honey-100 disabled:opacity-40"
                     disabled={approvalIndex === 0}
                     onClick={() =>
-                      setApprovalCursor(clampApprovalIndex(approvalIndex - 1, approvals.length))
+                      setApprovalCursorId(approvals[approvalIndex - 1]?.approvalId ?? null)
                     }
                   >
                     {STRINGS.approval.queue.previousShort}
@@ -1012,7 +1150,7 @@ export function ChatCore() {
                     className="type-mono-meta rounded-[4px] px-1.5 py-0.5 text-[10px] text-ink-700 hover:bg-honey-100 disabled:opacity-40"
                     disabled={approvalIndex >= approvals.length - 1}
                     onClick={() =>
-                      setApprovalCursor(clampApprovalIndex(approvalIndex + 1, approvals.length))
+                      setApprovalCursorId(approvals[approvalIndex + 1]?.approvalId ?? null)
                     }
                   >
                     {STRINGS.approval.queue.nextShort}
@@ -1089,6 +1227,19 @@ export function ChatCore() {
           )}
         </div>
 
+        {scrolledAway && messages.length > 0 ? (
+          <div className="-mt-9 flex justify-center">
+            <button
+              type="button"
+              data-testid="chat-jump-latest"
+              className="type-mono-meta pointer-events-auto rounded-[var(--radius-pill)] border border-honey-500 bg-honey-200 px-2 py-0.5 text-[10px] text-ink-900 shadow-[var(--shadow-e1)] hover:bg-honey-300"
+              onClick={jumpToLatest}
+            >
+              Jump to latest
+            </button>
+          </div>
+        ) : null}
+
         {/*
          * Composer zone. Kept as a shrink-0 sticky block: the transcript can
          * scroll/shrink, but the prompt input and the footer controls stay on
@@ -1139,7 +1290,8 @@ export function ChatCore() {
             type="button"
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-hairline text-ink-800 hover:bg-honey-100 disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Stop the active run"
-            disabled={connection !== 'open' || replaying || (streamingRunId === null && runStatus !== 'running')}
+            title={canCancel ? 'Cancel the active run' : 'No active run to cancel'}
+            disabled={connection !== 'open' || replaying || !canCancel}
             onClick={() => {
               void cancelRun();
             }}
@@ -1230,7 +1382,8 @@ export function ChatCore() {
                   <details className="max-h-[168px] overflow-y-auto rounded-[6px] border border-hairline bg-panel px-2 py-1">
                     <summary className="type-mono-meta cursor-pointer select-none truncate text-[10px] tracking-[0.08em] text-ink-700">
                       SESSION &amp; PERMISSIONS · {permissionPolicy} ·{' '}
-                      {selectedSession?.name ?? 'Default session'}
+                      {selectedSession?.name ?? 'Default session'} · {sessions.length}{' '}
+                      {sessions.length === 1 ? 'session' : 'sessions'}
                       {sessionLoadError ? ' · unavailable' : ''}
                     </summary>
                     <div className="mt-1 grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -1262,11 +1415,17 @@ export function ChatCore() {
                         <select
                           className="type-mono-code rounded-[8px] border border-hairline bg-panel px-1.5 py-1 text-[11px] text-ink-900 disabled:cursor-not-allowed disabled:opacity-60"
                           value={permissionPolicy}
-                          disabled={connection !== 'open' || replaying}
+                          disabled={
+                            connection !== 'open' ||
+                            replaying ||
+                            Boolean(selectedSession?.archived_at)
+                          }
                           title={
-                            namedSession
-                              ? 'Policy for this named session/run'
-                              : 'Policy for a new session or the default run'
+                            selectedSession?.archived_at
+                              ? 'Restore this archived session before changing its policy'
+                              : namedSession
+                                ? 'Policy for this named session/run'
+                                : 'Policy for a new session or the default run'
                           }
                           onChange={(event) =>
                             void changePolicy(
@@ -1283,7 +1442,7 @@ export function ChatCore() {
                     </div>
                     {sessionLoadError ? (
                       <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px] text-signal">
-                        <span>Sessions unavailable; default will be used.</span>
+                        <span>Sessions unavailable; the current selection is kept.</span>
                         <button
                           type="button"
                           className="type-mono-meta rounded-[4px] border border-signal px-1.5 py-0.5 text-[10px] text-signal hover:bg-signal/10 disabled:opacity-50"
@@ -1331,6 +1490,7 @@ export function ChatCore() {
                         type="button"
                         className="type-mono-meta rounded-[6px] border border-hairline bg-panel px-1.5 py-0.5 text-[10px] text-ink-800 hover:border-honey-400 disabled:opacity-50"
                         disabled={!selectedSession || sessionBusy || connection !== 'open'}
+                        aria-busy={sessionBusy}
                         title={
                           selectedSession
                             ? 'Archive or restore the selected named session'
@@ -1340,7 +1500,24 @@ export function ChatCore() {
                       >
                         {selectedSession?.archived_at ? 'Restore session' : 'Archive session'}
                       </button>
+                      <button
+                        type="button"
+                        className="type-mono-meta rounded-[6px] border border-hairline bg-panel px-1.5 py-0.5 text-[10px] text-ink-700 hover:border-honey-400 disabled:opacity-50"
+                        disabled={connection !== 'open' || sessionBusy}
+                        title="Reload the session list from the server"
+                        onClick={() => {
+                          setSessionLoadError(false);
+                          setSessionReload((current) => current + 1);
+                        }}
+                      >
+                        Refresh
+                      </button>
                     </div>
+                    {sessionsLoaded && sessions.length === 0 ? (
+                      <p className="type-mono-meta mt-1 text-[10px] text-meta">
+                        No named sessions yet; the default session is used until one is created.
+                      </p>
+                    ) : null}
                     <div className="mt-1 flex flex-wrap items-center gap-1">
                       <label className="sr-only" htmlFor="new-session-name">
                         New session name

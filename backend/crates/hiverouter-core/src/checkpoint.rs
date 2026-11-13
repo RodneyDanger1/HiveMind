@@ -65,6 +65,12 @@ use crate::db::{Database, DbError, Migration};
 /// with [`CheckpointJournal::with_max_file_bytes`]; they cannot raise it.
 pub const MAX_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Hard bound on a checkpoint id accepted by the id-addressed API (128 bytes).
+///
+/// Ids are uuid-v7 strings (36 bytes); the bound exists so a hostile caller
+/// cannot push an unbounded string through the refusal path or the SQL layer.
+pub const MAX_CHECKPOINT_ID_BYTES: usize = 128;
+
 /// Name recorded in `schema_migrations` for [`CHECKPOINT_MIGRATION`].
 pub const CHECKPOINT_MIGRATION_NAME: &str = "checkpoint_journal";
 
@@ -235,6 +241,35 @@ pub struct RestoreOutcome {
     pub restored: Vec<RestoredFile>,
 }
 
+/// Receipt returned by [`CheckpointJournal::restore_by_id`].
+///
+/// The receipt is produced only after both recorded digests were verified and
+/// the restored bytes were read back and matched against the pre-image. It is
+/// deliberately a value (not a log line): the caller can persist it as evidence
+/// that a specific checkpoint id was undone at a specific instant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreReceipt {
+    /// The checkpoint id that was restored.
+    pub checkpoint_id: String,
+    /// Run the checkpoint belongs to.
+    pub run_id: RunId,
+    /// Journal sequence of the restored entry.
+    pub seq: u64,
+    /// Workspace-relative path that was restored.
+    pub path: String,
+    /// State observed immediately before the restore; verified equal to the
+    /// recorded after-state (the file had not drifted).
+    pub observed_after: FileState,
+    /// State the path was restored to; verified equal to the recorded
+    /// pre-image.
+    pub restored_to: FileState,
+    /// Bytes written by the restore (`0` when the path was removed because it
+    /// did not exist before the mutation).
+    pub bytes_written: u64,
+    /// When the restore completed.
+    pub restored_at: Timestamp,
+}
+
 /// Checkpoint journal failure with its stable refusal identity where one exists.
 #[derive(Debug, Error)]
 pub enum CheckpointError {
@@ -266,6 +301,26 @@ pub enum CheckpointError {
         run_id: String,
         /// Journal sequence.
         seq: u64,
+    },
+    /// No checkpoint exists for the supplied checkpoint id.
+    #[error("checkpoint `{0}` does not exist")]
+    CheckpointIdNotFound(String),
+    /// The supplied path is not the path the checkpoint was recorded for.
+    ///
+    /// A checkpoint id is bound to exactly one workspace path; restoring a
+    /// different path through it would write the pre-image of one file over
+    /// another, so the mismatch is refused before any validation or write.
+    #[error(
+        "checkpoint {checkpoint_id} was recorded for {recorded:?}, not {requested:?}; \
+         restore refused"
+    )]
+    PathMismatch {
+        /// Checkpoint id as stored.
+        checkpoint_id: String,
+        /// Path recorded in the journal.
+        recorded: String,
+        /// Path supplied by the caller.
+        requested: String,
     },
     /// The `(run, seq)` pair already has a journal entry.
     #[error("checkpoint ({run_id}, {seq}) has already been journaled")]
@@ -340,6 +395,8 @@ impl CheckpointError {
             Self::RunNotFound(_) => Refusal::RunNotFound,
             Self::Db(error) => error.refusal(),
             Self::CheckpointNotFound { .. }
+            | Self::CheckpointIdNotFound(_)
+            | Self::PathMismatch { .. }
             | Self::DuplicateSeq { .. }
             | Self::Incomplete { .. }
             | Self::NotRemovable { .. }
@@ -717,6 +774,100 @@ impl CheckpointJournal {
     /// Database/decode failures.
     pub fn get(&self, run_id: RunId, seq: u64) -> Result<Option<FileCheckpoint>, CheckpointError> {
         self.query_checkpoint(run_id, seq)
+    }
+
+    /// Reads one journal entry by its stable checkpoint id.
+    ///
+    /// # Errors
+    /// [`CheckpointError::Tool`] when the id is empty or over
+    /// [`MAX_CHECKPOINT_ID_BYTES`], plus database/decode failures.
+    pub fn get_by_id(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<FileCheckpoint>, CheckpointError> {
+        validate_checkpoint_id(checkpoint_id)?;
+        self.query_checkpoint_by_id(checkpoint_id)
+    }
+
+    /// Restores one checkpoint addressed by **checkpoint id + path** and returns
+    /// a verified receipt.
+    ///
+    /// This is the operator-facing undo primitive. It is intentionally stricter
+    /// than [`Self::restore_entry`]:
+    ///
+    /// 1. the checkpoint id must exist and the supplied path must resolve, under
+    ///    the workspace [`WorkspaceJail`], to exactly the path recorded in the
+    ///    journal (a mismatch, traversal, absolute path, symlink or junction
+    ///    escape is refused before anything is read or written);
+    /// 2. the entry must be complete (an unknown after-state cannot be
+    ///    drift-checked);
+    /// 3. the current file must still match the recorded **after** SHA-256/size
+    ///    of the restored **before** SHA-256/size; a stale (externally edited)
+    ///    file, a missing/extra file, or a tampered journal row/blob is a
+    ///    refusal, never an overwrite;
+    /// 4. the restore is atomic (same-directory temp file, fsync, rename) and the
+    ///    written bytes are read back and compared with the recorded pre-image
+    ///    before the receipt is returned.
+    ///
+    /// Restoring the same entry twice is refused: after the first restore the
+    /// current file matches the pre-image, not the recorded after-state, so the
+    /// second call is drift. Re-applying a mutation is a new mutation and must
+    /// be journaled; this API never guesses a redo state.
+    ///
+    /// # Errors
+    /// [`CheckpointError::CheckpointIdNotFound`],
+    /// [`CheckpointError::PathMismatch`], [`CheckpointError::Drift`],
+    /// [`CheckpointError::Incomplete`], [`CheckpointError::Corrupt`] for a
+    /// tampered row/blob, and jail/I/O/database failures.
+    pub fn restore_by_id(
+        &self,
+        checkpoint_id: &str,
+        requested_path: &str,
+    ) -> Result<RestoreReceipt, CheckpointError> {
+        validate_checkpoint_id(checkpoint_id)?;
+        let checkpoint = self
+            .query_checkpoint_by_id(checkpoint_id)?
+            .ok_or_else(|| CheckpointError::CheckpointIdNotFound(checkpoint_id.to_owned()))?;
+        // Validate the caller-supplied path through the jail first: this must
+        // run even when the path "looks" equal to the stored one, because the
+        // filesystem may have been rearranged (junction/symlink) since.
+        let (resolved_key, _) = self.normalized_key(requested_path)?;
+        if resolved_key != checkpoint.path {
+            return Err(CheckpointError::PathMismatch {
+                checkpoint_id: checkpoint.checkpoint_id,
+                recorded: checkpoint.path,
+                requested: resolved_key,
+            });
+        }
+        let expected = checkpoint
+            .after
+            .clone()
+            .ok_or_else(|| CheckpointError::Incomplete {
+                run_id: checkpoint.run_id.to_string(),
+                seq: checkpoint.seq,
+            })?;
+        let plan = PathPlan {
+            path: checkpoint.path.clone(),
+            expected: expected.clone(),
+            target: checkpoint.before.clone(),
+            seqs: vec![checkpoint.seq],
+        };
+        // `validate_plan` proves the current file still hashes to the recorded
+        // after-state and that the pre-image blob still hashes to the recorded
+        // before-state. Nothing is written before both proofs pass.
+        self.validate_plan(&plan)?;
+        self.apply_plan(&plan)?;
+        self.mark_restored(checkpoint.run_id, &plan.seqs)?;
+        Ok(RestoreReceipt {
+            checkpoint_id: checkpoint.checkpoint_id,
+            run_id: checkpoint.run_id,
+            seq: checkpoint.seq,
+            path: plan.path,
+            observed_after: expected,
+            bytes_written: plan.target.size().unwrap_or(0),
+            restored_to: plan.target,
+            restored_at: Timestamp::now(),
+        })
     }
 
     /// Reads every journal entry for a run, newest sequence first.
@@ -1281,6 +1432,28 @@ impl CheckpointJournal {
         row.map(decode_row).transpose()
     }
 
+    fn query_checkpoint_by_id(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<FileCheckpoint>, CheckpointError> {
+        let row = self
+            .database
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT checkpoint_id, run_id, seq, path, existed_before,
+                                before_sha256, before_size, after_sha256, after_size,
+                                completed, created_at, completed_at, restored_at
+                         FROM checkpoints WHERE checkpoint_id = ?1",
+                        rusqlite::params![checkpoint_id],
+                        row_to_data,
+                    )
+                    .optional()
+            })
+            .map_err(CheckpointError::Db)?;
+        row.map(decode_row).transpose()
+    }
+
     fn query_entries(
         &self,
         run_id: RunId,
@@ -1662,6 +1835,26 @@ fn canonicalize_target(resolved: &Path) -> Result<PathBuf, CheckpointError> {
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validates a caller-supplied checkpoint id at the API boundary.
+fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), CheckpointError> {
+    if checkpoint_id.trim().is_empty() {
+        return Err(refused(Refusal::ToolSchema, "checkpoint id is empty"));
+    }
+    if checkpoint_id.len() > MAX_CHECKPOINT_ID_BYTES {
+        return Err(refused(
+            Refusal::ToolSchema,
+            format!("checkpoint id exceeds {MAX_CHECKPOINT_ID_BYTES} bytes"),
+        ));
+    }
+    if checkpoint_id.chars().any(char::is_control) {
+        return Err(refused(
+            Refusal::ToolSchema,
+            "checkpoint id contains control characters",
+        ));
+    }
+    Ok(())
 }
 
 fn map_tool_error(error: ToolError) -> CheckpointError {

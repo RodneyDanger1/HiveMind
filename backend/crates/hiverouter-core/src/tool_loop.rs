@@ -288,11 +288,18 @@ pub fn bounded_tool_text(text: &str) -> String {
     if text.len() <= MAX_TOOL_RESULT_BYTES {
         return text.to_owned();
     }
-    let mut end = MAX_TOOL_RESULT_BYTES;
+    // The truncation marker is part of the returned body, so it must fit inside
+    // the advertised cap; otherwise every truncated result overruns
+    // `MAX_TOOL_RESULT_BYTES` by the marker length.
+    let marker = format!("\n[truncated at {MAX_TOOL_RESULT_BYTES} bytes]");
+    let mut end = MAX_TOOL_RESULT_BYTES.saturating_sub(marker.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[truncated at {MAX_TOOL_RESULT_BYTES} bytes]", &text[..end])
+    let mut bounded = String::with_capacity(end + marker.len());
+    bounded.push_str(&text[..end]);
+    bounded.push_str(&marker);
+    bounded
 }
 
 /// Returns the next turn after a completed one, or a named refusal at the cap.
@@ -312,6 +319,21 @@ pub fn next_turn(completed_turns: u32) -> Result<u32, Refusal> {
 /// [`Refusal::CallLimit`] when the run has exhausted its call budget.
 pub fn check_call_budget(used_calls: u32) -> Result<(), Refusal> {
     if used_calls >= MAX_CALLS_PER_RUN {
+        return Err(Refusal::CallLimit);
+    }
+    Ok(())
+}
+
+/// Checks the per-run approval-wait budget before arming a new wait.
+///
+/// The count must be re-read under the per-run approval slot before arming:
+/// two concurrent tasks can both observe a below-cap count and otherwise arm
+/// one wait too many.
+///
+/// # Errors
+/// [`Refusal::CallLimit`] when the run has exhausted its approval waits.
+pub fn check_approval_wait_budget(waits: u32) -> Result<(), Refusal> {
+    if waits >= MAX_APPROVAL_WAITS_PER_RUN {
         return Err(Refusal::CallLimit);
     }
     Ok(())

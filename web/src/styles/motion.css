@@ -603,3 +603,24 @@
     background-position: -40% 0, 0 0;
   }
 }
+
+/* ------------------------------------------------------------------------- */
+/* 3c. Bee wing flutter - the route glyph's wings beat a few degrees.         */
+/* Transform-only on two tiny ellipses per edge; stopped under stillness.     */
+/* ------------------------------------------------------------------------- */
+@keyframes bee-wing-flap {
+  0%, 100% { transform: scaleY(1); }
+  46% { transform: scaleY(0.52); }
+}
+
+.bee-wings { transform-box: fill-box; }
+.bee-wing {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: bee-wing-flap 1.15s ease-in-out infinite;
+  will-change: transform;
+}
+.bee-wing-far { animation-delay: -0.14s; }
+
+[data-ambient-motion="off"] .bee-wing { animation: none !important; }
+[data-ambient-motion="calm"] .bee-wing { animation-duration: 1.8s; }
