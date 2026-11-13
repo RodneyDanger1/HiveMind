@@ -28,9 +28,10 @@ use hiverouter_core::db::Database;
 use hiverouter_core::entities::TaskRecord;
 use hiverouter_core::store::RunStore;
 
+use hiverouter_core::semantic_recall::Verification;
 use memory_context::{
     build_context, build_for_task, estimate_tokens, MemoryContextError, MemoryContextLimits,
-    MemoryScope, MemoryTier, ScoringMode, Verification,
+    MemoryScope, MemoryTier, ScoringMode,
 };
 
 fn entry(

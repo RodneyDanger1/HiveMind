@@ -819,6 +819,8 @@ pub fn build_context(
     let total = kept.len();
     let rendered = render_bounded(&kept, limits)?;
     let redactions = rendered.entries.iter().map(|entry| entry.redactions).sum();
+    let rendered_chars = rendered.rendered.chars().count();
+    let rendered_tokens = estimate_tokens(&rendered.rendered);
     Ok(MemoryContext {
         truncated: rendered.truncated,
         omitted_entries: total.saturating_sub(rendered.entries.len()),
@@ -830,8 +832,8 @@ pub fn build_context(
         unreadable_excluded,
         duplicates_removed,
         redactions,
-        chars: rendered.rendered.chars().count(),
-        estimated_tokens: estimate_tokens(&rendered.rendered),
+        chars: rendered_chars,
+        estimated_tokens: rendered_tokens,
         max_chars: limits.max_chars,
         max_tokens: limits.max_tokens,
         scoring,
@@ -1200,6 +1202,9 @@ fn render_bounded(
 
     let (reserve_chars, reserve_tokens) = footer_reserve(sorted.len());
     let mut second_entries = sorted.to_vec();
+    // If the footer reserve leaves no room for even one clipped entry, fall
+    // back to the first pass and omit the footer. The hard caps still hold and
+    // the explicit `truncated` flag still reports the omission.
     let second = render_pass(
         &mut second_entries,
         limits.max_chars,
@@ -1207,22 +1212,31 @@ fn render_bounded(
         reserve_chars,
         reserve_tokens,
     )
-    .ok_or(MemoryContextError::CapTooSmall)?;
-    if second.included == 0 {
-        return Err(MemoryContextError::CapTooSmall);
-    }
+    .filter(|pass| pass.included > 0)
+    .unwrap_or(first);
     second_entries.truncate(second.included);
 
     let mut rendered = second.rendered;
     let omitted = second.omitted;
     let any_clipped = second_entries.iter().any(|entry| entry.clipped);
     if omitted > 0 {
-        rendered.push_str(&format!(
+        let footer = format!(
             "\n[memory context truncated: {omitted} of {} entries omitted]",
             sorted.len()
-        ));
+        );
+        if rendered.chars().count() + footer.chars().count() <= limits.max_chars
+            && estimate_tokens(&rendered) + estimate_tokens(&footer) <= limits.max_tokens
+        {
+            rendered.push_str(&footer);
+        }
     } else if any_clipped {
-        rendered.push_str("\n[memory context truncated: content clipped to the value or context cap]");
+        let footer =
+            "\n[memory context truncated: content clipped to the value or context cap]";
+        if rendered.chars().count() + footer.chars().count() <= limits.max_chars
+            && estimate_tokens(&rendered) + estimate_tokens(footer) <= limits.max_tokens
+        {
+            rendered.push_str(footer);
+        }
     }
     if rendered.chars().count() > limits.max_chars
         || estimate_tokens(&rendered) > limits.max_tokens
