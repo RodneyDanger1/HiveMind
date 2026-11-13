@@ -491,3 +491,42 @@ test(
 
   await mcp.close();
 });
+
+test(
+  'refuses API reads when launch.token is absent (no secret printed)',
+  { timeout: 20_000 },
+  async (t) => {
+    const fake = await startFakeHiveMind();
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hivemind-mcp-notoken-'));
+    const mcp = new McpProcess({ HIVEROUTER_URL: fake.url, HIVEROUTER_DATA_DIR: dataDir });
+    t.after(async () => {
+      await mcp.close();
+      await fake.close();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    });
+
+    await mcp.request('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'smoke', version: '1.0.0' },
+    });
+    mcp.notify('notifications/initialized', {});
+
+    // /health is not launch-gated, so the server is still usable for diagnostics.
+    const health = toolPayload(
+      await mcp.request('tools/call', { name: 'hivemind_health', arguments: {} }),
+    );
+    assert.equal(health.status, 'ok');
+
+    const refused = await mcp.request('tools/call', {
+      name: 'hivemind_logs',
+      arguments: { source: 'stdout', tail: 5 },
+    });
+    assert.equal(refused.result.isError, true);
+    assert.match(refused.result.content[0].text, /E_ORIGIN_REJECTED/);
+    assert.equal(mcp.stderr.includes(LAUNCH_TOKEN), false);
+    assert.equal(mcp.stderr.includes(SESSION_TOKEN), false);
+
+    await mcp.close();
+  },
+);

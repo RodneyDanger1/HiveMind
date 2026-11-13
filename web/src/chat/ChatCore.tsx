@@ -765,11 +765,10 @@ export function ChatCore() {
   const approvalTargetKnown =
     pendingApproval === null ||
     networkApprovalTargetKnown(pendingApproval.tool, pendingApproval.argsPreview);
-  // The store's dismiss action only removes terminal approvals that have a
-  // resolve record. A client-clock expiry without one cannot be dismissed, so
-  // do not render a button that would silently do nothing.
-  const approvalDismissable =
-    approvalActions?.dismiss === true && pendingApprovalResolve !== undefined;
+  // The store permits local dismissal of a client-clock-expired approval even
+  // when no server resolve record exists, so the button is safe whenever the
+  // approval state machine says this request is terminal.
+  const approvalDismissable = approvalActions?.dismiss === true;
 
   if (!chat.visible) {
     // The header owns the one canonical Show/Hide control; a second floating

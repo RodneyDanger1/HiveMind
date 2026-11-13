@@ -332,7 +332,10 @@ impl ShellPolicy {
             .collect();
         allowed.sort();
         allowed.dedup();
-        let command_specs = allowed.iter().map(CommandSpec::new).collect();
+        let command_specs = allowed
+            .iter()
+            .map(|program| CommandSpec::new(program.clone()))
+            .collect();
         Self {
             allowed_programs: allowed,
             command_specs,
@@ -1161,7 +1164,7 @@ mod tests {
         assert_eq!(error.code(), "E_TOOL_TIMEOUT");
 
         use sysinfo::{ProcessesToUpdate, System};
-        let mut system = System::new_all();
+        let mut system = System::new_all().expect("sysinfo system");
         system.refresh_processes(ProcessesToUpdate::All, true);
         let current = sysinfo::get_current_pid().expect("current pid");
         assert!(

@@ -24,6 +24,13 @@
 //!   names, canonicalizes the target, and verifies that the canonical target
 //!   is still inside the canonical workspace root. A symlink that resolves
 //!   outside the root is rejected.
+//! * **Symbol index.** `repo_symbols` stores bounded declarations extracted
+//!   from Rust, TypeScript/JavaScript, Python, and Go sources.
+//!   [`search_symbols`] filters by case-insensitive name substring and exact
+//!   [`SYMBOL_KINDS`] kind, returning path, 1-based line, kind, and a bounded
+//!   signature, capped at [`MAX_SYMBOL_RESULTS`]. The table is created by
+//!   [`ensure_schema`] (and lazily by [`search_symbols`] for databases indexed
+//!   before symbols existed).
 //! * **FTS5 fail closed.** If the SQLite build cannot create an FTS5 virtual
 //!   table, [`probe_fts5`] and [`index_workspace`] return
 //!   [`RepoIndexError::Fts5Unavailable`]. There is no `LIKE` fallback.
@@ -44,6 +51,16 @@
 //! itself cannot fail on a SQLite build without FTS5. The first call to
 //! [`index_workspace`] (or [`ensure_schema`]) probes FTS5, then installs
 //! [`FTS_SCHEMA_V26`] and fails closed if the probe fails.
+//!
+//! # Lead wiring
+//!
+//! The symbol-search tool should call [`search_symbols`] with the workspace id
+//! (or [`search_workspace_symbols`] with the root) and pass the user's name
+//! query, an optional `kind` from [`SYMBOL_KINDS`], and a limit at most
+//! [`MAX_SYMBOL_RESULTS`]. Results are plain data (`SymbolHit`) and can be
+//! mapped directly to the tool's response shape. No registry change is required for the schema: the
+//! symbol table is part of `SCHEMA_V26`, which the existing `repo_index`
+//! migration already runs.
 
 use std::collections::HashMap;
 use std::fs::{self, File};

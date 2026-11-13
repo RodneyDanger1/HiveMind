@@ -17,7 +17,7 @@ use hiverouter_core::entities::{ChatRole, PermissionPolicy, TaskRecord};
 use hiverouter_core::store::RunStore;
 use session_model::{
     assess_continuation, attach_run, continuation_context, latest_resumable_run, session_run_model,
-    AttachOutcome, ContinueDecision, ContinueReason, ContextSource, SessionModelError,
+    AttachOutcome, ContextSource, ContinueDecision, ContinueReason, SessionModelError,
     DEFAULT_CONTINUATION_BUDGET_BYTES, MAX_CONTINUATION_BUDGET_BYTES, MAX_PENDING_TODOS,
     MAX_PENDING_TODO_TEXT_BYTES, MAX_SESSION_RUNS,
 };
@@ -146,12 +146,18 @@ fn attach_records_run_ids_in_order_and_reports_last_completed_and_pending_work()
     assert_eq!(model.runs[0].status, AgentState::Failed);
     assert_eq!(model.runs[0].error_code.as_deref(), Some("E_PROVIDER"));
     assert_eq!(
-        model.last_completed_run.as_ref().map(|run| run.run_id.clone()),
+        model
+            .last_completed_run
+            .as_ref()
+            .map(|run| run.run_id.clone()),
         Some(second.to_string())
     );
     assert_eq!(model.pending_work.active_run_count, 1);
     assert_eq!(model.pending_work.active_runs[0].run_id, third.to_string());
-    assert_eq!(model.pending_work.active_runs[0].status, AgentState::Running);
+    assert_eq!(
+        model.pending_work.active_runs[0].status,
+        AgentState::Running
+    );
     assert_eq!(model.pending_work.open_todo_count, 1);
     assert_eq!(model.pending_work.open_todos[0].text, "open todo");
     assert_eq!(model.pending_work.unfinished_task_count, 1);
@@ -186,6 +192,11 @@ fn attach_is_idempotent_and_refuses_cross_project_foreign_and_archived_sessions(
         Err(SessionModelError::ProjectMismatch { .. })
     ));
 
+    assert!(matches!(
+        fixture.read(|connection| attach_run(connection, &session_id, "missing-run")),
+        Err(SessionModelError::RunNotFound(_))
+    ));
+
     let unbound = fixture.run("project-a");
     let unbound_id = unbound.to_string();
     fixture
@@ -200,10 +211,6 @@ fn attach_is_idempotent_and_refuses_cross_project_foreign_and_archived_sessions(
     assert!(matches!(
         fixture.read(|connection| attach_run(connection, "missing", &unbound_id)),
         Err(SessionModelError::SessionNotFound(_))
-    ));
-    assert!(matches!(
-        fixture.read(|connection| attach_run(connection, &session_id, "missing-run")),
-        Err(SessionModelError::RunNotFound(_))
     ));
 }
 
@@ -254,6 +261,7 @@ fn continuation_context_is_byte_bounded_and_cites_persisted_provenance() {
     assert_eq!(context.items[1].text, "task result from child");
     assert!(!context.items[1].truncated);
     assert_eq!(context.items[1].source, ContextSource::TaskResult);
+    assert_eq!(context.items[1].source.as_str(), "task_result");
     assert_eq!(context.items[1].record_id, child.to_string());
     assert_eq!(context.items[1].run_id, second.to_string());
     assert_eq!(context.items[1].role, None);
@@ -399,22 +407,46 @@ fn continuation_decision_accepts_failed_and_interrupted_and_refuses_live_work() 
     let fixture = Fixture::new();
     let session_id = fixture.session("project-1");
     let cases = [
-        (AgentState::Failed, ContinueDecision::ContinueSession, ContinueReason::FailedRunContinuable),
+        (
+            AgentState::Failed,
+            ContinueDecision::ContinueSession,
+            ContinueReason::FailedRunContinuable,
+        ),
         (
             AgentState::Interrupted,
             ContinueDecision::ContinueSession,
             ContinueReason::InterruptedRunContinuable,
         ),
-        (AgentState::Running, ContinueDecision::Refuse, ContinueReason::RunStillActive),
-        (AgentState::Queued, ContinueDecision::Refuse, ContinueReason::RunStillActive),
+        (
+            AgentState::Running,
+            ContinueDecision::Refuse,
+            ContinueReason::RunStillActive,
+        ),
+        (
+            AgentState::Queued,
+            ContinueDecision::Refuse,
+            ContinueReason::RunStillActive,
+        ),
         (
             AgentState::AwaitingApproval,
             ContinueDecision::Refuse,
             ContinueReason::ApprovalPending,
         ),
-        (AgentState::Completed, ContinueDecision::StartNewRun, ContinueReason::RunCompleted),
-        (AgentState::Cancelled, ContinueDecision::StartNewRun, ContinueReason::RunCancelled),
-        (AgentState::Killed, ContinueDecision::StartNewRun, ContinueReason::RunKilled),
+        (
+            AgentState::Completed,
+            ContinueDecision::StartNewRun,
+            ContinueReason::RunCompleted,
+        ),
+        (
+            AgentState::Cancelled,
+            ContinueDecision::StartNewRun,
+            ContinueReason::RunCancelled,
+        ),
+        (
+            AgentState::Killed,
+            ContinueDecision::StartNewRun,
+            ContinueReason::RunKilled,
+        ),
     ];
     for (state, expected_decision, expected_reason) in cases {
         let run = fixture.run("project-1");
@@ -453,9 +485,7 @@ fn continuation_decision_accepts_failed_and_interrupted_and_refuses_live_work() 
         .set_session_archived(&archived_session, true)
         .expect("archive");
     let archived = fixture
-        .read(|connection| {
-            assess_continuation(connection, &archived_session, &failed.to_string())
-        })
+        .read(|connection| assess_continuation(connection, &archived_session, &failed.to_string()))
         .expect("archived assessment");
     assert_eq!(archived.decision, ContinueDecision::Refuse);
     assert_eq!(archived.reason, ContinueReason::SessionArchived);
@@ -533,7 +563,7 @@ fn session_model_caps_the_run_ledger_and_pending_summary() {
                 "project-1",
                 "prompt",
                 AgentState::Completed,
-                Some(&session_id),
+                Some(session_id.as_str()),
                 PermissionPolicy::Classic,
             )
             .expect("create scoped run");

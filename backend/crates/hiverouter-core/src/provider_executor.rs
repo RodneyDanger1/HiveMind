@@ -889,7 +889,7 @@ impl ProviderExecutor for ProviderExecutorAdapter {
                 let sink = Arc::clone(on_delta);
                 Arc::new(move |fragment: &str| {
                     emitted.store(true, Ordering::SeqCst);
-                    sink(fragment);
+                    sink.as_ref()(fragment);
                 })
             };
             let result = self

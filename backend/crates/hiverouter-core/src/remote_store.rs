@@ -54,7 +54,7 @@ pub fn ensure_schema(db: &Database) -> Result<(), HiveWireError> {
                 PRIMARY KEY (remote_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS hivewire_messages_ready
-                ON hivewire_messages(state, rowid);
+                ON hivewire_messages(state);
             CREATE INDEX IF NOT EXISTS hivewire_messages_task
                 ON hivewire_messages(remote_id, task_id);
             CREATE INDEX IF NOT EXISTS hivewire_sessions_remote
@@ -180,10 +180,10 @@ impl HiveWireStore {
     pub fn open(db: Arc<Database>, config: HiveWireConfig) -> Result<Self, HiveWireError> {
         config.validate()?;
         ensure_schema(&db)?;
-        let token = config.launch_token.as_deref().unwrap_or_default();
+        let token_sha256 = token_digest(config.launch_token.as_deref().unwrap_or_default());
         Ok(Self {
             db,
-            token_sha256: token_digest(token),
+            token_sha256,
             config,
         })
     }

@@ -50,6 +50,7 @@ import {
   canRetryApproval,
   classifyApprovalRefusal,
   initialApprovalReplayState,
+  isApprovalExpired,
   initialApprovalResolveState,
   isReplayWindowOpen,
   markApprovalsStale,
@@ -2403,10 +2404,17 @@ export function createUiStore(api: UiApi, options: UiStoreOptions = {}): StoreAp
 
       dismissApproval(approvalId: string): void {
         const resolve = get().approvalResolve[approvalId];
+        const approval = get().approvals.find((candidate) => candidate.approvalId === approvalId);
+        const locallyExpired =
+          approval !== undefined && isApprovalExpired(approval.expiresAt, Date.now());
         if (resolve === undefined) {
-          return;
-        }
-        if (
+          // A client-clock-expired request may have no server resolve record
+          // (the server replays expired rows as absent). It must still be
+          // dismissable locally, otherwise the card is a dead end.
+          if (!locallyExpired) {
+            return;
+          }
+        } else if (
           resolve.status !== 'expired' &&
           resolve.status !== 'stale' &&
           resolve.status !== 'unconfirmed'

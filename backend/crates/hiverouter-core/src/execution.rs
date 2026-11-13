@@ -2623,9 +2623,24 @@ impl RunEngine {
                  finish: report it as unfinished and never present its work as done.\n",
             );
             let all_tasks = self.store.tasks_for_run(run.id)?;
+            // The CEO reads its managers' compressed judgement, not every
+            // leaf's raw transcript. Fall back to all children only for a
+            // flat run where no direct manager exists.
+            let managers = all_tasks
+                .iter()
+                .filter(|task| task.parent_task_id == Some(root.id))
+                .collect::<Vec<_>>();
+            let synthesis_tasks = if managers.is_empty() {
+                all_tasks
+                    .iter()
+                    .filter(|task| task.id != root.id)
+                    .collect::<Vec<_>>()
+            } else {
+                managers
+            };
             let mut digest = format!("Run digest: {} task(s).\n", all_tasks.len());
             let mut unfinished_children = 0usize;
-            for child in all_tasks.iter().filter(|task| task.id != root.id) {
+            for child in synthesis_tasks.iter().copied() {
                 // A failed/cancelled child is not the same as a child that
                 // produced no text: the root must not present its work as done.
                 if child.state != AgentState::Completed {
@@ -2657,7 +2672,7 @@ impl RunEngine {
             }
             self.store.write_run_digest(run.id, &digest)?;
             let mut omitted = 0usize;
-            for child in all_tasks.iter().filter(|task| task.id != root.id) {
+            for child in synthesis_tasks.iter().copied() {
                 let result = self.store.task_result(child.id)?;
                 let text = match result {
                     Some(text) if !text.trim().is_empty() => {
@@ -2703,7 +2718,7 @@ impl RunEngine {
             // deterministic.
             if self.root_orchestrator
                 && self.executor.supports_root_review()
-                && all_tasks.iter().any(|task| task.id != root.id)
+                && !synthesis_tasks.is_empty()
             {
                 self.claim_provider_call(run.id)?;
                 let mut monitor_prompt = String::from(
@@ -6368,6 +6383,12 @@ impl RunEngine {
                 } else {
                     format!("report_result success=false: {summary}")
                 };
+                if !success {
+                    // A failed/blocked report is not a completed seat: the
+                    // parent gate and the root synthesis must see the failure.
+                    self.fail_task(run, task, AgentState::Failed)?;
+                    return Ok(None);
+                }
                 let terminal = StreamedReply {
                     deltas: if report_text.is_empty() { Vec::new() } else { vec![report_text] },
                     usage: final_reply.usage,

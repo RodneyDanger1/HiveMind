@@ -153,14 +153,14 @@ fn filters_by_kind_and_orders_exact_matches_first() {
 fn result_count_and_query_bounds_are_enforced() {
     let (_temp, connection, workspace) = fixture();
 
-    let capped = repo_index::search_symbols(&connection, workspace.id(), "", None, 2)
+    let capped = repo_index::search_symbols(&connection, workspace.id(), "a", None, 2)
         .expect("capped search");
     assert_eq!(capped.len(), 2, "the caller limit caps the result set");
 
     let over = repo_index::search_symbols(
         &connection,
         workspace.id(),
-        "",
+        "a",
         None,
         MAX_SYMBOL_RESULTS + 1,
     )

@@ -7,6 +7,7 @@
 //! read-only.
 
 use hiverouter_core::execution::{shell_command_mutates, terminal_verified, ToolTurnTranscript};
+use hiverouter_core::tool_loop::{ToolCallPlan, ToolExecution};
 
 fn plan(tool: &str, args: serde_json::Value) -> ToolCallPlan {
     ToolCallPlan {

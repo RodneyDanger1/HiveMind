@@ -222,6 +222,9 @@ class HiveMindClient {
       clearTimeout(timer);
     }
     const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > MAX_MESSAGE_BYTES) {
+      throw new HiveMindError('E_RESPONSE_TOO_LARGE', `GET ${pathname} returned too much data`);
+    }
     let body = null;
     try {
       body = text.length === 0 ? null : JSON.parse(text);
@@ -749,10 +752,18 @@ async function callTool(client, name, rawArgs) {
     case 'hivemind_health':
       return client.getJson('/health', { authenticated: false });
     case 'hivemind_run': {
-      const prompt = optionalString(args, 'prompt', { min: 1, max: MAX_PROMPT_CHARS });
-      if (prompt === null) {
-        throw new HiveMindError('E_SCHEMA_INVALID', 'prompt is required');
+      if (typeof args.prompt !== 'string') {
+        throw new HiveMindError('E_SCHEMA_INVALID', 'prompt is required and must be a string');
       }
+      if (args.prompt.length < 1 || args.prompt.length > MAX_PROMPT_CHARS) {
+        throw new HiveMindError(
+          'E_SCHEMA_INVALID',
+          `prompt must be 1..${MAX_PROMPT_CHARS} characters`,
+        );
+      }
+      // Preserve the prompt exactly: trimming would change code blocks and
+      // leading indentation the user intentionally supplied.
+      const prompt = args.prompt;
       const projectId = optionalString(args, 'project_id') || DEFAULT_PROJECT;
       const sessionId = optionalString(args, 'session_id');
       const policy = optionalString(args, 'permission_policy', { max: 20 });
@@ -819,8 +830,15 @@ function respondError(id, code, message, data) {
   send({ jsonrpc: '2.0', id, error });
 }
 
-const cliOptions = parseArgv(process.argv.slice(2));
-const client = new HiveMindClient(resolveBaseUrl(cliOptions), cliOptions);
+let client;
+try {
+  const cliOptions = parseArgv(process.argv.slice(2));
+  client = new HiveMindClient(resolveBaseUrl(cliOptions), cliOptions);
+} catch (failure) {
+  // Configuration failures happen before any request; no token is involved.
+  process.stderr.write(`hivemind-mcp: ${failure?.message || 'configuration error'}\n`);
+  process.exit(2);
+}
 let initialized = false;
 
 async function handle(request) {
@@ -904,11 +922,6 @@ function finishIfDrained() {
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
-  if (Buffer.byteLength(buffer, 'utf8') > MAX_MESSAGE_BYTES) {
-    buffer = '';
-    respondError(null, -32700, 'parse error: message too large');
-    return;
-  }
   for (;;) {
     const newline = buffer.indexOf('\n');
     if (newline < 0) break;
@@ -932,6 +945,11 @@ process.stdin.on('data', (chunk) => {
         pending -= 1;
         finishIfDrained();
       });
+  }
+  // A single unterminated message that exceeds the cap is a protocol failure.
+  if (Buffer.byteLength(buffer, 'utf8') > MAX_MESSAGE_BYTES) {
+    buffer = '';
+    respondError(null, -32700, 'parse error: message too large');
   }
 });
 process.stdin.on('end', () => {

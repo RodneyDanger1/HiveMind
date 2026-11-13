@@ -27,9 +27,10 @@
 //! Runs are ordered by `(created_at ASC, rowid ASC)`, i.e. insertion order with
 //! a deterministic tie-break for timestamps that share a second. Messages and
 //! task results are ordered first by their run's position, then by
-//! `(created_at ASC, rowid ASC)`. The continuation context is emitted in that
-//! ascending order; selection for the byte budget happens from the newest item
-//! backwards.
+//! `(created_at ASC, source ASC, record_id ASC)`; at the same timestamp a chat
+//! message precedes a task result, and record ids break any remaining tie.
+//! The continuation context is emitted in that ascending order; selection for
+//! the byte budget happens from the newest item backwards.
 //!
 //! # Boundedness
 //!
@@ -108,7 +109,9 @@ pub enum SessionModelError {
         session_project: String,
     },
     /// The requested continuation budget is outside the allowed range.
-    #[error("E_CONTEXT_BUDGET_INVALID: budget {0} is outside 1..={MAX_CONTINUATION_BUDGET_BYTES} bytes")]
+    #[error(
+        "E_CONTEXT_BUDGET_INVALID: budget {0} is outside 1..={MAX_CONTINUATION_BUDGET_BYTES} bytes"
+    )]
     InvalidBudget(usize),
     /// A stored run status is not one this binary knows.
     #[error("E_RUN_STATE_UNKNOWN: run {run_id} has persisted status {status:?}")]
@@ -214,9 +217,7 @@ impl PendingWork {
     /// True when nothing is outstanding.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.active_run_count == 0
-            && self.open_todo_count == 0
-            && self.unfinished_task_count == 0
+        self.active_run_count == 0 && self.open_todo_count == 0 && self.unfinished_task_count == 0
     }
 }
 
@@ -488,7 +489,10 @@ pub fn attach_run(
         if current_session == session_id {
             return Ok(AttachOutcome::AlreadyAttached);
         }
-        return Err(SessionModelError::RunInOtherSession(run_id.to_owned(), current_session));
+        return Err(SessionModelError::RunInOtherSession(
+            run_id.to_owned(),
+            current_session,
+        ));
     }
     // Guarded update: only an unbound run is attached. If another writer won
     // the race, re-read and report the concrete outcome instead of pretending
@@ -509,11 +513,12 @@ pub fn attach_run(
             )
             .optional()?;
         match now {
-            Some(Some(bound)) if bound == session_id => {
-                return Ok(AttachOutcome::AlreadyAttached)
-            }
+            Some(Some(bound)) if bound == session_id => return Ok(AttachOutcome::AlreadyAttached),
             Some(Some(bound)) => {
-                return Err(SessionModelError::RunInOtherSession(run_id.to_owned(), bound))
+                return Err(SessionModelError::RunInOtherSession(
+                    run_id.to_owned(),
+                    bound,
+                ))
             }
             Some(None) if attempt == 0 => continue,
             _ => break,
@@ -528,7 +533,10 @@ pub fn attach_run(
 /// # Errors
 /// [`SessionModelError`] when the session is missing, a run carries an unknown
 /// state, or SQLite fails.
-pub fn session_run_model(connection: &Connection, session_id: &str) -> SessionResult<SessionRunModel> {
+pub fn session_run_model(
+    connection: &Connection,
+    session_id: &str,
+) -> SessionResult<SessionRunModel> {
     let session = load_session(connection, session_id)?;
     let total_runs_i64: i64 = connection.query_row(
         "SELECT COUNT(*) FROM runs WHERE session_id = ?1",
@@ -562,7 +570,8 @@ pub fn session_run_model(connection: &Connection, session_id: &str) -> SessionRe
                     status: raw_status,
                 }
             })?;
-            let ordinal = u64::try_from(offset).unwrap_or(0)
+            let ordinal = u64::try_from(offset)
+                .unwrap_or(0)
                 .saturating_add(u64::try_from(runs.len()).unwrap_or(0))
                 .saturating_add(1);
             runs.push(SessionRun {
@@ -575,7 +584,10 @@ pub fn session_run_model(connection: &Connection, session_id: &str) -> SessionRe
             });
         }
     }
-    let run_ids = runs.iter().map(|run| run.run_id.clone()).collect::<Vec<_>>();
+    let run_ids = runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<Vec<_>>();
     let last_completed_run = connection
         .query_row(
             "SELECT id, updated_at
@@ -646,8 +658,7 @@ pub fn continuation_context(
     {
         let mut statement = connection.prepare(
             "SELECT m.id, m.run_id, m.role, m.text, m.created_at,
-                    r.created_at AS run_created_at, r.rowid AS run_rowid,
-                    m.rowid AS record_rowid
+                    r.created_at AS run_created_at, r.rowid AS run_rowid
              FROM chat_messages m
              JOIN runs r ON r.id = m.run_id
              WHERE r.session_id = ?1
@@ -665,15 +676,13 @@ pub fn continuation_context(
                 created_at: row.get(4)?,
                 run_created_at: row.get(5)?,
                 run_rowid: row.get(6)?,
-                record_rowid: row.get(7)?,
             });
         }
     }
     {
         let mut statement = connection.prepare(
             "SELECT tr.task_id, tr.run_id, tr.text, tr.created_at,
-                    r.created_at AS run_created_at, r.rowid AS run_rowid,
-                    tr.rowid AS record_rowid
+                    r.created_at AS run_created_at, r.rowid AS run_rowid
              FROM task_results tr
              JOIN runs r ON r.id = tr.run_id
              WHERE r.session_id = ?1
@@ -691,7 +700,6 @@ pub fn continuation_context(
                 created_at: row.get(3)?,
                 run_created_at: row.get(4)?,
                 run_rowid: row.get(5)?,
-                record_rowid: row.get(6)?,
             });
         }
     }
@@ -708,10 +716,7 @@ pub fn continuation_context(
         let (text, truncated) = if original_bytes <= remaining {
             (item.text, false)
         } else {
-            (
-                truncate_to_bytes(&item.text, remaining).to_owned(),
-                true,
-            )
+            (truncate_to_bytes(&item.text, remaining).to_owned(), true)
         };
         remaining = remaining.saturating_sub(text.len());
         selected.push(ContextItem {
@@ -728,9 +733,13 @@ pub fn continuation_context(
     selected.reverse();
 
     let used_bytes = selected.iter().map(|item| item.text.len()).sum::<usize>();
-    let original_bytes = selected.iter().map(|item| item.original_bytes).sum::<usize>();
+    let original_bytes = selected
+        .iter()
+        .map(|item| item.original_bytes)
+        .sum::<usize>();
     let any_truncated = selected.iter().any(ContextItem::is_truncated);
-    let omitted_items = total_items.saturating_sub(fetched) + fetched.saturating_sub(selected.len());
+    let omitted_items =
+        total_items.saturating_sub(fetched) + fetched.saturating_sub(selected.len());
     let mut source_run_ids: Vec<String> = Vec::new();
     for item in &selected {
         if !source_run_ids.iter().any(|id| id == &item.run_id) {
@@ -777,12 +786,7 @@ pub fn assess_continuation(
     let bound_session = row.ok_or_else(|| SessionModelError::RunNotFound(run_id.to_owned()))?;
     match bound_session {
         Some(bound) if bound == session_id => {}
-        Some(other) => {
-            return Err(SessionModelError::RunNotInSession(
-                run_id.to_owned(),
-                other,
-            ))
-        }
+        Some(other) => return Err(SessionModelError::RunNotInSession(run_id.to_owned(), other)),
         None => {
             return Err(SessionModelError::RunNotInSession(
                 run_id.to_owned(),
@@ -795,15 +799,13 @@ pub fn assess_continuation(
         params![run_id],
         |row| row.get(0),
     )?;
-    let status = parse_agent_state(&raw_status).ok_or_else(|| SessionModelError::UnknownRunState {
-        run_id: run_id.to_owned(),
-        status: raw_status,
-    })?;
+    let status =
+        parse_agent_state(&raw_status).ok_or_else(|| SessionModelError::UnknownRunState {
+            run_id: run_id.to_owned(),
+            status: raw_status,
+        })?;
     let (decision, reason) = if session.archived {
-        (
-            ContinueDecision::Refuse,
-            ContinueReason::SessionArchived,
-        )
+        (ContinueDecision::Refuse, ContinueReason::SessionArchived)
     } else {
         match status {
             AgentState::Failed => (
@@ -821,23 +823,18 @@ pub fn assess_continuation(
             | AgentState::Planning
             | AgentState::Thinking
             | AgentState::Running
-            | AgentState::Streaming => {
-                (ContinueDecision::Refuse, ContinueReason::RunStillActive)
-            }
-            AgentState::Completed => {
-                (ContinueDecision::StartNewRun, ContinueReason::RunCompleted)
-            }
-            AgentState::Cancelled => {
-                (ContinueDecision::StartNewRun, ContinueReason::RunCancelled)
-            }
+            | AgentState::Streaming => (ContinueDecision::Refuse, ContinueReason::RunStillActive),
+            AgentState::Completed => (ContinueDecision::StartNewRun, ContinueReason::RunCompleted),
+            AgentState::Cancelled => (ContinueDecision::StartNewRun, ContinueReason::RunCancelled),
             AgentState::Killed => (ContinueDecision::StartNewRun, ContinueReason::RunKilled),
             AgentState::Healthy
             | AgentState::Empty
             | AgentState::Loading
             | AgentState::Reconnecting
-            | AgentState::Replay => {
-                (ContinueDecision::Refuse, ContinueReason::RunStateNotRunnable)
-            }
+            | AgentState::Replay => (
+                ContinueDecision::Refuse,
+                ContinueReason::RunStateNotRunnable,
+            ),
         }
     };
     Ok(ContinueAssessment {
@@ -917,7 +914,8 @@ fn load_pending_work(connection: &Connection, session_id: &str) -> SessionResult
              ORDER BY created_at ASC, rowid ASC
              LIMIT ?2",
         )?;
-        let mut rows = statement.query(params![session_id, i64_from_usize(MAX_PENDING_ACTIVE_RUNS)])?;
+        let mut rows =
+            statement.query(params![session_id, i64_from_usize(MAX_PENDING_ACTIVE_RUNS)])?;
         while let Some(row) = rows.next()? {
             let run_id: String = row.get(0)?;
             let raw_status: String = row.get(1)?;
@@ -994,20 +992,19 @@ struct CollectedItem {
     created_at: String,
     run_created_at: String,
     run_rowid: i64,
-    record_rowid: i64,
 }
 
 impl CollectedItem {
-    fn sort_key(&self) -> (&str, i64, &str, i64, u8) {
+    fn sort_key(&self) -> (&str, i64, &str, u8, &str) {
         (
             &self.run_created_at,
             self.run_rowid,
             &self.created_at,
-            self.record_rowid,
             match self.source {
                 ContextSource::ChatMessage => 0,
                 ContextSource::TaskResult => 1,
             },
+            &self.record_id,
         )
     }
 }

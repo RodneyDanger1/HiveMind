@@ -8,8 +8,13 @@
 pub mod approval_wait;
 pub mod bus;
 pub mod caps;
+pub mod chat_bus;
 pub mod checkpoint;
+pub mod delegation_protocol;
+pub mod hivewire;
 pub mod jobs;
+pub mod semantic_recall;
+pub mod session_model;
 pub mod repo_index;
 pub mod checks;
 pub mod config;

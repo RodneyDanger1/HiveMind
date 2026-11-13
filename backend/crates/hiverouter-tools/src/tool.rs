@@ -845,6 +845,7 @@ impl ToolRegistry {
                 ToolId::GitStatus,
                 ToolId::GitDiff,
                 ToolId::GitLog,
+                ToolId::HarnessDiagnose,
             ],
         );
         allowlists.insert(

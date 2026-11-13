@@ -2575,16 +2575,30 @@ async fn pending_approvals(
         None => state.tools.pending_approval_events_all(20),
     };
     match result {
-        Ok(events) => (
-            StatusCode::OK,
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(serde_json::json!({
-                "run_id": run_id.map(|id| id.to_string()),
-                "count": events.len(),
-                "approvals": events,
-            })),
-        )
-            .into_response(),
+        Ok(mut events) => {
+            // A pending row can outlive a run that failed between the request
+            // and its boot-time reaper. Never show an actionable approval for
+            // a terminal run.
+            events.retain(|event| {
+                event.run_id.map_or(true, |id| {
+                    state
+                        .engine
+                        .store
+                        .get_run(id)
+                        .map_or(false, |run| !run.status.is_terminal())
+                })
+            });
+            (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({
+                    "run_id": run_id.map(|id| id.to_string()),
+                    "count": events.len(),
+                    "approvals": events,
+                })),
+            )
+                .into_response()
+        }
         Err(refusal) => refusal_response(StatusCode::SERVICE_UNAVAILABLE, &refusal),
     }
 }

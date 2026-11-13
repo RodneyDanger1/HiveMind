@@ -246,7 +246,7 @@ pub enum Verification {
 impl Verification {
     /// Maps the persisted trust label; absence is `Unknown`, never `Verified`.
     #[must_use]
-    pub const fn from_trust(trust: Option<&str>) -> Self {
+    pub fn from_trust(trust: Option<&str>) -> Self {
         match trust {
             Some("authoritative") => Self::Authoritative,
             Some("verified") => Self::Verified,
@@ -723,17 +723,11 @@ fn stem(token: &str) -> String {
                 stemmed.push('y');
             }
             "es" => {
-                let base = &stemmed[..stemmed.len() - 2];
-                if base.ends_with('s')
-                    || base.ends_with('x')
-                    || base.ends_with('z')
-                    || base.ends_with("ch")
-                    || base.ends_with("sh")
-                {
-                    stemmed.truncate(stemmed.len() - 2);
-                } else {
-                    stemmed.truncate(stemmed.len() - 1);
-                }
+                // Drop only the plural `s`: `caches` -> `cache`, `boxes` ->
+                // `boxe`. Keeping one deterministic rule per suffix is worth
+                // more here than English exception tables; near-singulars still
+                // meet the trigram fuzzy threshold.
+                stemmed.truncate(stemmed.len() - 1);
             }
             "ation" | "ating" | "ated" => {
                 stemmed.truncate(stemmed.len() - suffix.len());

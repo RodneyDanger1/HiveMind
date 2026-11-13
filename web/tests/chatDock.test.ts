@@ -210,12 +210,12 @@ describe('chat dock error + approval states', () => {
     expect(markup).toContain(STRINGS.approval.queue.next);
   });
 
-  it('does not render a dead dismiss for a client-expired approval with no resolve record', () => {
+  it('renders a working local dismiss for a client-expired approval with no resolve record', () => {
     const markup = renderWith(createElement(ChatCore), {
       approvals: [approval({ expiresAt: '2000-01-01T00:00:00.000Z' })],
     });
     expect(markup).toContain(STRINGS.approval.expiry.expired);
-    expect(countOf(markup, `>${STRINGS.approval.dismiss}</button>`)).toBe(0);
+    expect(countOf(markup, `>${STRINGS.approval.dismiss}</button>`)).toBe(1);
   });
 
   it('explains a nonce-less approval instead of offering enabled decisions', () => {

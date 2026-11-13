@@ -19,7 +19,9 @@
 //! 3. [`CheckpointJournal::restore_entry`] restores one entry atomically
 //!    (same-directory temp file, fsync, rename) after proving the file still
 //!    matches the recorded after-state, and verifies the restored bytes against
-//!    the content-addressed SHA-256.
+//!    the content-addressed SHA-256. [`CheckpointJournal::restore_by_id`] is the
+//!    id-addressed operator API: it binds a checkpoint id to the recorded path,
+//!    verifies both digests, and returns a [`RestoreReceipt`].
 //! 4. [`CheckpointJournal::restore_to`] rewinds every entry of a run at or above
 //!    a sequence number. Every affected path is validated **before** the first
 //!    write, so a drift refusal cannot leave a half-restored workspace; each
@@ -34,6 +36,15 @@
 //! The SQLite schema ships as [`CHECKPOINT_MIGRATION`]. The Lead appends it to
 //! [`crate::db::MIGRATIONS`]; [`checkpoint_migration`] exists so the migration can
 //! be renumbered without editing this module (Coordinator/CAP conflicts).
+//!
+//! # Lead wiring
+//!
+//! The undo tool should resolve `checkpoint_id + path` and call
+//! [`CheckpointJournal::restore_by_id`], returning the serialized
+//! [`RestoreReceipt`] as its result. Do not call [`CheckpointJournal::restore_entry`]
+//! from a tool that accepts a caller-supplied path: only `restore_by_id`
+//! re-validates the path binding and returns the receipt. `restore_entry` and
+//! `restore_to` remain the internal run-rewind primitives.
 //!
 //! # Refusal identity
 //!

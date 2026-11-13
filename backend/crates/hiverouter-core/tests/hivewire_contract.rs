@@ -159,14 +159,20 @@ fn envelope_is_versioned_and_validated() {
     let store = HiveWireStore::open(database, config()).expect("store");
     let ack = store.handshake(&hello("hello-1"), TOKEN).expect("handshake");
 
-    let mut frame = task_frame(&ack.session_id, ack.next_sequence, "msg-1", "task-1");
+    let queued = task_frame(&ack.session_id, ack.next_sequence, "msg-1", "task-1");
+    assert_eq!(
+        store.accept(&queued).expect("task"),
+        hivewire::AcceptOutcome::Queued { sequence: 1 }
+    );
+
+    let mut frame = task_frame(&ack.session_id, 2, "msg-bad-version", "task-x");
     frame.protocol = "hivewire.v0".to_owned();
     assert_eq!(
         store.accept(&frame).expect_err("old protocol").code(),
         "E_HIVEWIRE_VERSION"
     );
 
-    let mut frame = task_frame(&ack.session_id, ack.next_sequence, "msg-1", "task-1");
+    let mut frame = task_frame(&ack.session_id, 2, "msg-missing-sequence", "task-x");
     frame.sequence = None;
     assert_eq!(
         store.accept(&frame).expect_err("missing sequence").code(),
@@ -185,10 +191,9 @@ fn envelope_is_versioned_and_validated() {
     );
 
     // A result for the queued task settles it exactly once.
-    let ack2 = store.handshake(&hello("hello-3"), TOKEN).expect("second handshake");
     let result = WireEnvelope::post_handshake(
-        &ack2.session_id,
-        ack2.next_sequence,
+        &ack.session_id,
+        2,
         "msg-result-1",
         MessageBody::Result(hivewire::TaskResult {
             task_id: "task-1".to_owned(),
