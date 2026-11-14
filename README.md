@@ -10,11 +10,20 @@ version remains the release authority; the working tree is pre-release and unsea
 
 **Truth baseline (observed 2026-11-12, integration branch):** capability work is
 on `integration/capability-absorb`; schema is **v32** (sessions/policy, repo index,
-checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **22 tools / 81 grants / 80 named refusals**;
-`/health` is `degraded` with `E_KEY_MISSING` in a keyless profile; docs truth
-checker **19/19 PASS**; the full backend workspace gate passes. This is
-**pre-release** work, not a clean release seal; the sealed `1.1.0` remains the
-release authority.
+checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **23 tools / 85 grants / 80 named refusals**;
+`/health` is `ok` on a configured profile; docs truth checker **19/19 PASS**; the
+full backend workspace gate and the full web gate pass. This is **pre-release**
+work, not a clean release seal; the sealed `1.1.0` remains the release authority.
+
+**Recent verified fixes (2026-11-13):** workspace reads are no longer denied when
+the workspace lives inside the data root; `harness_diagnose` is a real
+read-only agent tool with health/log/workspace scopes; blocked child reports are
+persisted as failed instead of completed; pending approvals for terminal runs are
+filtered out; expired approvals can be dismissed locally; the root HyperAgent
+reads only its direct managers' compressed results; and every planned seat now
+receives its own objective instead of the whole run prompt. Evidence:
+`docs/evidence/delegation-audit-20261113-163346.md` and
+`docs/research/HIERARCHICAL-DELEGATION.md`.
 
 Read the full evidence and boundary before relying on any claim:
 [truth report](docs/audit/HIVEMIND-TRUTH-AND-ROADMAP-2026-11-10.md),
@@ -30,6 +39,28 @@ the full-width bottom chat dock, Controls / State & settings tray, run-status ch
 agent run list, and the completed three-SuperAgent run detail.
 
 ![HiveMind Help & Tutorials — first-run, dock, and safety guidance](docs/evidence/screenshots/hivemind-help.png)
+
+## Capability status (wired vs library-only)
+
+These are the current boundaries, not a feature wish-list:
+
+- **Wired and exercised:** local server + SQLite, planner → HyperAgent → SuperAgent → worker
+  DAGs with per-seat objectives, approvals, run history, tool calls (`file_read`, `fs_glob`,
+  `fs_grep`, `file_read_range`, `apply_patch`, `run_tests`, git read/write tools,
+  `shell_exec`, `harness_diagnose`), workspace jail with data-file denies, `/api/logs`,
+  `/diagnose`, the MCP stdio server in `tools/hivemind-mcp`, and the workbench UI panels.
+- **Library primitives wired into the crate, not yet exposed as agent tools/routes:**
+  per-tree chat bus (`chat_bus.rs`), delegation seat protocol (`delegation_protocol.rs`),
+  lexical semantic recall (`semantic_recall.rs`), HiveWire in-process queue + lease
+  scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), session continuation
+  model (`session_model.rs`), file-checkpoint restore and repository symbol search
+  (`checkpoint.rs`/`repo_index.rs`).
+- **Not present:** autonomous coding/self-modification, a continuous daemon, OS
+  filesystem/network sandboxing, network remote transport, embeddings/ANN, automatic
+  weight/skill/code learning, and a live 40-node provider proof.
+
+A primitive in the second list is real code with tests, but it is **not** a
+user-callable feature until the route/tool wiring lands. Do not cite it as shipped.
 
 ---
 
