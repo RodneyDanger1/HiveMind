@@ -459,6 +459,10 @@ function CanvasInner() {
       id="hive-canvas"
       ref={canvasRef}
       className="relative h-full min-h-0 w-full"
+      style={{
+        paddingBottom: chatVisible ? 'var(--chat-dock-height, 0px)' : undefined,
+        transition: 'padding-bottom 180ms ease',
+      }}
       role="application"
       aria-label="HiveMind spatial canvas"
       tabIndex={-1}

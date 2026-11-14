@@ -438,10 +438,17 @@ export function ChatCore() {
   // drag (streaming reply, store echo) would otherwise restore the last React
   // height, so put the live drag height back before the browser paints.
   useIsomorphicLayoutEffect(() => {
+    const height = dockHeight(resizing ? liveHeightRef.current : chatHeight, dockTab);
     const node = panelRef.current;
     if (node !== null) {
-      node.style.height = `${dockHeight(resizing ? liveHeightRef.current : chatHeight, dockTab)}px`;
+      node.style.height = `${height}px`;
     }
+    // The canvas is a sibling of this fixed dock; expose the live dock height
+    // so the graph viewport can shrink instead of hiding agent cards behind it.
+    document.documentElement.style.setProperty(
+      '--chat-dock-height',
+      chat.visible ? `${height}px` : '0px',
+    );
   });
   const fileTreeRoot = useUiStore((state) => state.fileTree.root);
   const projectId = useUiStore((state) => state.project.id);
