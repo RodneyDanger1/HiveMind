@@ -352,28 +352,30 @@ export function FileTree({
       aria-busy={status === 'loading'}
       className={`flex min-h-0 flex-col overflow-hidden rounded-[var(--radius-card)] border border-hairline bg-panel shadow-[var(--shadow-e1)] ${className}`}
     >
-      <header className="flex flex-wrap items-center gap-2 border-b border-hairline bg-panel-alt px-3 py-2">
-        <div className="flex min-w-0 flex-1 items-baseline gap-2">
+      <header className="flex flex-col gap-1 border-b border-hairline bg-panel-alt px-3 py-2">
+        <div className="flex min-w-0 items-baseline justify-between gap-2">
           <h2 className="type-label shrink-0 whitespace-nowrap text-ink-900">
             {FILE_TREE_COPY.section}
           </h2>
-          <span className="type-mono-meta truncate text-meta" title={root ?? undefined}>
-            {root ?? FILE_TREE_COPY.root}
+          <span className="type-mono-meta shrink-0 text-meta">
+            {fileCount} {FILE_TREE_COPY.file}
+            {fileCount === 1 ? '' : 's'}
           </span>
         </div>
-        <span className="type-mono-meta shrink-0 text-meta">
-          {fileCount} {FILE_TREE_COPY.file}
-          {fileCount === 1 ? '' : 's'}
-        </span>
-        <button
-          type="button"
-          className="type-mono-meta shrink-0 whitespace-nowrap rounded-[var(--radius-sm)] border border-hairline bg-panel px-2 py-1 text-ink-800 hover:bg-honey-100 disabled:cursor-not-allowed disabled:opacity-50"
-          aria-label={FILE_TREE_COPY.refresh}
-          disabled={onRefresh === undefined || status === 'loading'}
-          onClick={() => onRefresh?.()}
-        >
-          {FILE_TREE_COPY.refresh}
-        </button>
+        <div className="flex min-w-0 items-center justify-between gap-2">
+          <span className="type-mono-meta min-w-0 truncate text-meta" title={root ?? undefined}>
+            {root ?? FILE_TREE_COPY.root}
+          </span>
+          <button
+            type="button"
+            className="type-mono-meta shrink-0 whitespace-nowrap rounded-[var(--radius-sm)] border border-hairline bg-panel px-2 py-1 text-ink-800 hover:bg-honey-100 disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label={FILE_TREE_COPY.refresh}
+            disabled={onRefresh === undefined || status === 'loading'}
+            onClick={() => onRefresh?.()}
+          >
+            {FILE_TREE_COPY.refresh}
+          </button>
+        </div>
       </header>
 
       {status === 'idle' ? (
