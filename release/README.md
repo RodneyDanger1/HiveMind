@@ -1,10 +1,10 @@
 # HiveMind 1.2.0-dev portable release
 
-Built from `ad3401a` on
+Built from `b9223f4` on
 `integration/capability-absorb`, 2026-11-13, schema **32**.
 
 - Archive: `HiveMind-1.2.0-dev-win64.zip`
-- SHA-256: `4343F029AF82BDA4192B394C45A9C58A1F042A2C489EB18A30D7388B6686B041`
+- SHA-256: `4A67EC2AC4FA5971DBA50C052136255471A1FAEBF871999C70D9EE777DAEA8C8`
   (also in `HiveMind-1.2.0-dev-win64.zip.sha256`)
 - Includes: `HiveMind.exe` launcher, `hiverouter.exe`, web UI, packaged CLI,
   MCP stdio server, installer/uninstaller scripts, `BUILD.json`, `CHECKSUMS.txt`.
