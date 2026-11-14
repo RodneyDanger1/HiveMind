@@ -55,6 +55,7 @@ never sent off-host.
 | `hivemind_run_status` | `GET /api/runs/{id}/detail` or `/api/runs/active` | omit `run_id` for the active projection |
 | `hivemind_logs` | `GET /api/logs?source=&tail=` | `source` required; `tail` 1..5000 (default 200) |
 | `hivemind_runs` | `GET /api/history/runs` | newest first, server caps at 200 |
+| `hivemind_continue` | Continue a session; POST /api/sessions/{id}/continue with bounded prior context. |
 | `hivemind_approvals` | `GET /api/approvals?run_id=` | read-only; never consumes a nonce |
 
 `hivemind_run` arguments: `prompt` (required, 1..8000 chars), `project_id`
