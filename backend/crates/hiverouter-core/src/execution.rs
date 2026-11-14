@@ -24,8 +24,8 @@ use hiverouter_tools::approval::{ApprovalDecision, ApprovalResolution};
 use hiverouter_tools::shell::ShellPolicy;
 use hiverouter_tools::{
     execute_read_only, AgentTier, AskParentArgs, ExecutedTool as ToolsExecutedTool,
-    HarnessDiagnoseArgs, PermissionClass, RepoSearchArgs, SendToSiblingArgs, SpawnAgentArgs, ToolId,
-    ToolRegistry, WorkspaceJail,
+    HarnessDiagnoseArgs, MemoryRecallArgs, PermissionClass, RepoSearchArgs, SendToSiblingArgs,
+    SpawnAgentArgs, ToolId, ToolRegistry, WorkspaceJail,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -3713,6 +3713,47 @@ impl RunEngine {
                     plan.tool_call_id.clone(),
                     refusal.code(),
                     "repo_search refused the requested symbol query".to_owned(),
+                ),
+            };
+        }
+        if plan.tool == ToolId::MemoryRecall.id() {
+            let Some(tools) = self.tools.as_ref() else {
+                return ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    Refusal::FileTreeUnavailable.code(),
+                    "the memory bridge is unavailable; nothing was read".to_owned(),
+                );
+            };
+            let args: MemoryRecallArgs = match serde_json::from_value(plan.args.clone()) {
+                Ok(args) => args,
+                Err(_) => {
+                    return ToolExecution::refused(
+                        plan.tool_call_id.clone(),
+                        Refusal::SchemaInvalid.code(),
+                        "memory_recall arguments did not match {query,limit?}".to_owned(),
+                    );
+                }
+            };
+            let Some(run_id) = self.active_run() else {
+                return ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    Refusal::RunNotFound.code(),
+                    "memory_recall needs an active run; nothing was read".to_owned(),
+                );
+            };
+            return match tools.memory_recall(
+                run_id,
+                &args.query,
+                args.limit.unwrap_or(10).clamp(1, 50),
+            ) {
+                Ok(value) => ToolExecution::ok(
+                    plan.tool_call_id.clone(),
+                    tool_loop::bounded_tool_text(&value.to_string()),
+                ),
+                Err(refusal) => ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    refusal.code(),
+                    "memory_recall refused the requested query".to_owned(),
                 ),
             };
         }

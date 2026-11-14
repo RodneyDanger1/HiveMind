@@ -161,6 +161,8 @@ pub enum ToolId {
     HarnessDiagnose,
     /// Search the repository symbol index by name/kind.
     RepoSearch,
+    /// Ranked recall over this run's persisted memory banks.
+    MemoryRecall,
 }
 
 impl ToolId {
@@ -192,6 +194,7 @@ impl ToolId {
             ToolId::GitLog => "git_log",
             ToolId::HarnessDiagnose => "harness_diagnose",
             ToolId::RepoSearch => "repo_search",
+            ToolId::MemoryRecall => "memory_recall",
         }
     }
 
@@ -398,6 +401,17 @@ pub struct RepoSearchArgs {
     #[serde(default)]
     pub kind: Option<String>,
     /// Maximum hits (1..=50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Arguments for [`ToolId::MemoryRecall`].
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecallArgs {
+    /// Natural-language query (2..=8192 bytes).
+    pub query: String,
+    /// Maximum ranked hits (1..=50).
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -792,6 +806,12 @@ impl ToolRegistry {
                 PermissionClass::Read,
                 schema_of!(RepoSearchArgs),
             ),
+            contract(
+                ToolId::MemoryRecall,
+                "Rank this run's persisted memory banks for a query. Read-only; returns scores, provenance, and bounded excerpts, never secrets.",
+                PermissionClass::Read,
+                schema_of!(MemoryRecallArgs),
+            ),
         ] {
             contracts.insert(contract.id, contract);
         }
@@ -815,6 +835,7 @@ impl ToolRegistry {
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
+                ToolId::MemoryRecall,
             ],
         );
         allowlists.insert(
@@ -844,6 +865,7 @@ impl ToolRegistry {
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
+                ToolId::MemoryRecall,
             ],
         );
         allowlists.insert(
@@ -872,6 +894,7 @@ impl ToolRegistry {
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
+                ToolId::MemoryRecall,
             ],
         );
         allowlists.insert(
@@ -890,6 +913,7 @@ impl ToolRegistry {
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
+                ToolId::MemoryRecall,
             ],
         );
         allowlists.insert(

@@ -1370,6 +1370,32 @@ impl ToolsBridge {
         }))
     }
 
+    /// Read-only ranked recall over this run's persisted memory banks.
+    ///
+    /// # Errors
+    /// `E_SCHEMA_INVALID` for an empty/oversized query or bad limit;
+    /// `E_INTERNAL_ERROR` when the store/index cannot be read.
+    pub fn memory_recall(
+        &self,
+        run_id: RunId,
+        query: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, Refusal> {
+        let store = crate::store::RunStore::new(self.db.clone());
+        let request = crate::semantic_recall::RecallQuery::new(query).with_limit(limit);
+        let response = crate::semantic_recall::recall_run(&store, run_id, &request).map_err(
+            |error| match error {
+                crate::semantic_recall::RecallError::EmptyQuery
+                | crate::semantic_recall::RecallError::QueryTooLong
+                | crate::semantic_recall::RecallError::InvalidLimit { .. } => {
+                    Refusal::SchemaInvalid
+                }
+                _ => Refusal::InternalError,
+            },
+        )?;
+        serde_json::to_value(response).map_err(|_| Refusal::InternalError)
+    }
+
     /// Sorted, bounded names of the workspace root entries for path diagnosis.
     ///
     /// Only names (directories suffixed with `/`) — never file bodies, sizes or
