@@ -32,6 +32,8 @@ Read the full evidence and boundary before relying on any claim:
 
 ## The running app
 
+![HiveMind splash — versioned startup surface](docs/evidence/screenshots/hivemind-splash.png)
+
 ![HiveMind desktop — completed three-branch run, live chat dock, action log](docs/evidence/screenshots/hivemind-current.png)
 
 Captured from the installed Windows build (`88a23cd`) on the live local server:
