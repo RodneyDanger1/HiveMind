@@ -337,3 +337,8 @@ loopback HiveMind server. It refuses non-loopback base URLs.
 - `initialize` negotiates MCP `2024-11-05`, `2025-03-26` or `2025-06-18`.
 - No behavior in this document is inferred from UI code; every route/field is
   cited to the Rust handler or struct that emits it.
+
+
+## Session continuation
+
+POST /api/sessions/{session_id}/continue with body {"prompt":"..."} returns 202 {session, run, continuation}. The run is seeded with the session's bounded prior context (8 KiB). 404 unknown session, 409 archived/active run, 400 empty/oversized prompt, 503 missing key.
