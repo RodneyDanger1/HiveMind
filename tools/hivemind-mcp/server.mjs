@@ -195,6 +195,58 @@ class HiveMindClient {
     return this.requestJson(pathname, { headers, authenticated, timeoutMs });
   }
 
+  /** POST a mutation route with the per-boot Bearer token and loopback Origin. */
+  async postJson(pathname, payload, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    const headers = {
+      ...(await this.authedHeaders()),
+      'content-type': 'application/json',
+      origin: this.baseUrl,
+    };
+    const url = `${this.baseUrl}${pathname}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    } catch (failure) {
+      if (failure?.name === 'AbortError') {
+        throw new HiveMindError('E_TIMEOUT', `POST ${pathname} timed out after ${timeoutMs}ms`);
+      }
+      throw new HiveMindError(
+        'E_SERVER_UNREACHABLE',
+        `cannot reach the HiveMind server at ${this.baseUrl}`,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    const text = await response.text();
+    let body = null;
+    try {
+      body = text.length === 0 ? null : JSON.parse(text);
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      const code = body && typeof body.code === 'string' ? body.code : 'E_HTTP_ERROR';
+      const message =
+        body && typeof body.message === 'string'
+          ? body.message
+          : `POST ${pathname} returned HTTP ${response.status}`;
+      if (response.status === 401) this.session = null;
+      throw new HiveMindError(code, this.redact(message));
+    }
+    if (body === null) {
+      throw new HiveMindError('E_SCHEMA_INVALID', `POST ${pathname} did not return JSON`);
+    }
+    return this.redactValue(body);
+  }
+
   async requestJson(
     pathname,
     { headers, authenticated, timeoutMs = DEFAULT_TIMEOUT_MS, redactValues = true },
@@ -715,6 +767,20 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
+    name: 'hivemind_continue',
+    description:
+      'Continue an existing session by submitting a new run seeded with that session’s bounded prior context (POST /api/sessions/{session_id}/continue). Returns the created run; it does not wait for completion.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', minLength: 8, maxLength: 80 },
+        prompt: { type: 'string', minLength: 1, maxLength: MAX_PROMPT_CHARS },
+      },
+      required: ['session_id', 'prompt'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'hivemind_approvals',
     description:
       'List pending approvals read-only (GET /api/approvals); never consumes a nonce and never resolves one.',
@@ -774,6 +840,20 @@ async function callTool(client, name, rawArgs) {
       if (sessionId !== null) payload.session_id = sessionId;
       if (policy !== null) payload.permission_policy = policy;
       return submitPrompt(client, payload, 30_000);
+    }
+    case 'hivemind_continue': {
+      const sessionId = optionalString(args, 'session_id', { min: 8, max: 80 });
+      if (sessionId === null) {
+        throw new HiveMindError('E_SCHEMA_INVALID', 'session_id is required');
+      }
+      if (typeof args.prompt !== 'string' || args.prompt.length < 1 || args.prompt.length > MAX_PROMPT_CHARS) {
+        throw new HiveMindError('E_SCHEMA_INVALID', `prompt must be 1..${MAX_PROMPT_CHARS} characters`);
+      }
+      return client.postJson(
+        `/api/sessions/${encodeURIComponent(sessionId)}/continue`,
+        { prompt: args.prompt },
+        { timeoutMs: 30_000 },
+      );
     }
     case 'hivemind_run_status': {
       const runId = optionalString(args, 'run_id', { min: 8, max: 80 });

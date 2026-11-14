@@ -404,6 +404,7 @@ test(
   const names = list.result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
     'hivemind_approvals',
+    'hivemind_continue',
     'hivemind_health',
     'hivemind_logs',
     'hivemind_run',
