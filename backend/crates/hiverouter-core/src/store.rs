@@ -345,6 +345,13 @@ impl RunStore {
         Self { db }
     }
 
+    /// Shared database handle for same-crate read models that need a SQLite
+    /// connection (session continuation context, diagnostics).
+    #[must_use]
+    pub(crate) fn database(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     /// Inserts a new run.
     ///
     /// # Errors
