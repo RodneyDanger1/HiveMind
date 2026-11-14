@@ -10,7 +10,7 @@ version remains the release authority; the working tree is pre-release and unsea
 
 **Truth baseline (observed 2026-11-12, integration branch):** capability work is
 on `integration/capability-absorb`; schema is **v32** (sessions/policy, repo index,
-checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **24 tools / 89 grants / 80 named refusals**;
+checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **25 tools / 93 grants / 80 named refusals**;
 `/health` is `ok` on a configured profile; docs truth checker **19/19 PASS**; the
 full backend workspace gate and the full web gate pass. This is **pre-release**
 work, not a clean release seal; the sealed `1.1.0` remains the release authority.
@@ -36,13 +36,13 @@ Read the full evidence and boundary before relying on any claim:
 
 ![HiveMind desktop — completed three-branch run, live chat dock, action log](docs/evidence/screenshots/hivemind-current.png)
 
-Captured from the installed Windows build (`88a23cd`) on the live local server:
+Captured from the installed Windows build (`ad3401a`) on the live local server:
 the full-width bottom chat dock, Controls / State & settings tray, run-status chip,
 agent run list, and the completed three-SuperAgent run detail.
 
 ![HiveMind Help & Tutorials — first-run, dock, and safety guidance](docs/evidence/screenshots/hivemind-help.png)
 
-![HiveMind approval card — shell_exec request with approve/deny and expiry](docs/evidence/screenshots/hivemind-approval.png)
+![HiveMind approval card — shell_exec request with approve/deny and expiry](docs/evidence/screenshots/hivemind-approval.png)`n`n![HiveMind Data surface — workspace tree, file preview, and checkpoint restore panel](docs/evidence/screenshots/hivemind-data-fixed.png)
 
 ## Capability status (wired vs library-only)
 
@@ -53,13 +53,12 @@ These are the current boundaries, not a feature wish-list:
   `fs_grep`, `file_read_range`, `apply_patch`, `run_tests`, git read/write tools,
   `shell_exec`, `harness_diagnose`), workspace jail with data-file denies, `/api/logs`,
   `/diagnose`, repo symbol search (`repo_search`), ranked memory recall (`memory_recall`), session-scoped run seeding (cross-run memory), the MCP stdio server in
-  `tools/hivemind-mcp`, and the workbench UI panels.
+  `tools/hivemind-mcp`, the Data-tab checkpoint restore panel, and the workbench UI panels.
 - **Library primitives wired into the crate, not yet exposed as agent tools/routes:**
   per-tree chat bus (`chat_bus.rs`), delegation seat protocol (`delegation_protocol.rs`),
   HiveWire in-process queue + lease
   scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), repository symbol primitives
-  (`repo_index.rs`). The session model is
-  wired for run seeding; it has no separate resume HTTP route yet.
+  (`repo_index.rs`). The session model is wired for run seeding and `POST /api/sessions/:id/continue`; the MCP server exposes it as `hivemind_continue`.
 - **Not present:** autonomous coding/self-modification, a continuous daemon, OS
   filesystem/network sandboxing, network remote transport, embeddings/ANN, automatic
   weight/skill/code learning, and a live 40-node provider proof.
