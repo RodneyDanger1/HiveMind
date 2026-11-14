@@ -15,6 +15,7 @@ import { STRINGS } from '../state/strings';
 import { Editor, FileTree, FILE_TREE_COPY, buildFileTreeNodes } from '../workbench';
 import type { FileTreeStatus } from '../workbench';
 import { PanelTitle, EmptyState, LoadingState, ErrorState } from './StatePack';
+import { DiffReviewPanel } from './DiffReviewPanel';
 
 const FILE_TREE_STATUS: Record<string, FileTreeStatus> = {
   idle: 'idle',
@@ -27,6 +28,7 @@ export function DataPanel() {
   const fileTree = useUiStore((state) => state.fileTree);
   const requestFileTree = useUiStore((state) => state.requestFileTree);
   const openFile = useUiStore((state) => state.openFile);
+  const run = useUiStore((state) => state.run);
 
   useEffect(() => {
     if (fileTree.status === 'idle') {
@@ -112,6 +114,9 @@ export function DataPanel() {
             readOnlyReason="Workspace reads are preview-only here; approved mutations run through the agent tool path."
           />
         ) : null}
+        <div className="mt-4 border-t border-hairline pt-3">
+          <DiffReviewPanel runId={run?.id ?? null} runStatus={run?.status ?? null} />
+        </div>
       </section>
     </div>
   );

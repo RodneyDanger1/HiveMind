@@ -18,6 +18,7 @@ import {
   killWorker,
   loadRunFileChanges,
   missingHopDetail,
+  restoreCheckpoint,
   parseFileState,
   parseRunFileChanges,
   readWorkspaceFile,
@@ -320,7 +321,7 @@ describe('panel rendering', () => {
   it('renders the diff panel idle and names both missing diff hops', () => {
     const markup = render(createElement(DiffReviewPanel, { runId: null }));
     expect(markup).toContain('Select a run to review its file changes.');
-    expect(markup).toContain('Line diff and apply/reject are unavailable.');
+    expect(markup).toContain('Line diff and merge apply/reject are unavailable.');
     expect(markup).toContain('DIFF_PROPOSE');
     expect(markup).toContain('DIFF_APPLY');
     expect(markup).toMatch(/disabled=""[^>]*>Refresh run changes/);
@@ -417,5 +418,43 @@ describe('monitor state predicates', () => {
     expect(isKillableTaskState('running')).toBe(true);
     expect(isKillableTaskState('awaiting_approval')).toBe(true);
     expect(isKillableTaskState(undefined)).toBe(false);
+  });
+});
+
+describe('checkpoint restore hop', () => {
+  it('posts the checkpoint restore route and parses the server receipt', async () => {
+    const calls: Array<{ url: string; method: string; authorization: string | null }> = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const headers = new Headers(init?.headers);
+      calls.push({
+        url: input,
+        method: init?.method ?? 'GET',
+        authorization: headers.get('authorization'),
+      });
+      return new Response(
+        JSON.stringify({
+          path: 'src/a.ts',
+          undone_seqs: [2, 1],
+          restored: { kind: 'absent' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    };
+    const receipt = await restoreCheckpoint('run-1', 2, {
+      fetchImpl,
+      sessionToken: 'test-token',
+    });
+    expect(calls).toEqual([
+      {
+        url: '/api/runs/run-1/checkpoints/2/restore',
+        method: 'POST',
+        authorization: 'Bearer test-token',
+      },
+    ]);
+    expect(receipt).toEqual({
+      path: 'src/a.ts',
+      undoneSeqs: [2, 1],
+      restored: { kind: 'absent' },
+    });
   });
 });

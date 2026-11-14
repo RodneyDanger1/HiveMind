@@ -372,6 +372,113 @@ export async function loadRunFileChanges(
   return parseRunFileChanges(body);
 }
 
+/** Receipt returned by `POST /api/runs/{run_id}/checkpoints/{seq}/restore`. */
+export interface RestoredCheckpoint {
+  readonly path: string;
+  readonly undoneSeqs: readonly number[];
+  readonly restored: FileState;
+}
+
+export interface RestoreCheckpointOptions extends LoadRunFileChangesOptions {
+  /** Bearer token; when omitted the helper reads `/api/session` once. */
+  readonly sessionToken?: string;
+}
+
+async function readSessionToken(
+  baseUrl: string,
+  fetchImpl: FetchLike,
+  signal?: AbortSignal,
+): Promise<string> {
+  let launchToken: string | null = null;
+  try {
+    if (typeof window !== 'undefined') {
+      launchToken = new URL(window.location.href).searchParams.get('launch');
+    }
+  } catch {
+    launchToken = null;
+  }
+  const response = await fetchImpl(`${baseUrl}/api/session`, {
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      ...(launchToken === null ? {} : { 'x-hivemind-launch': launchToken }),
+    },
+    ...(signal ? { signal } : {}),
+  });
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok || !isRecord(body) || typeof body.token !== 'string' || body.token.length === 0) {
+    throw new RefusalError(
+      refusalFromBody(body) ??
+        clientRefusal('E_TOKEN_INVALID', { message: 'GET /api/session did not return a token.' }),
+    );
+  }
+  return body.token;
+}
+
+/**
+ * Real mutation hop: restore one checkpoint. The server verifies the current
+ * and before-image digests before writing; a refusal is surfaced as-is.
+ */
+export async function restoreCheckpoint(
+  runId: string,
+  seq: number,
+  options: RestoreCheckpointOptions = {},
+): Promise<RestoredCheckpoint> {
+  if (runId.trim().length === 0) {
+    throw new RefusalError(clientRefusal('E_RUN_NOT_FOUND'));
+  }
+  if (!Number.isInteger(seq) || seq < 1) {
+    throw new RefusalError(clientRefusal('E_SCHEMA_INVALID', { message: 'seq must be >= 1' }));
+  }
+  const baseUrl = (options.baseUrl ?? '').replace(/\/+$/, '');
+  const fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
+  const token =
+    options.sessionToken ?? (await readSessionToken(baseUrl, fetchImpl, options.signal));
+  let response: Response;
+  try {
+    response = await fetchImpl(
+      `${baseUrl}/api/runs/${encodeURIComponent(runId)}/checkpoints/${seq}/restore`,
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          authorization: `Bearer ${token}`,
+        },
+        ...(options.signal ? { signal: options.signal } : {}),
+      },
+    );
+  } catch {
+    throw new RefusalError(
+      clientRefusal('E_WS_DISCONNECTED', { message: 'POST checkpoint restore failed.' }),
+    );
+  }
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    throw new RefusalError(
+      refusalFromBody(body) ??
+        clientRefusal('E_INTERNAL_ERROR', {
+          message: `POST checkpoint restore returned ${response.status}.`,
+        }),
+    );
+  }
+  if (!isRecord(body)) {
+    throw new RefusalError(
+      clientRefusal('E_SCHEMA_INVALID', { message: 'Restore response was not an object.' }),
+    );
+  }
+  const path = readNonEmptyString(body, 'path');
+  const restored = parseFileState(body.restored);
+  const undone = Array.isArray(body.undone_seqs)
+    ? body.undone_seqs.filter((value): value is number => Number.isInteger(value) && value > 0)
+    : null;
+  if (!path || restored === null || undone === null) {
+    throw new RefusalError(
+      clientRefusal('E_SCHEMA_INVALID', { message: 'Restore response did not match RestoredFile.' }),
+    );
+  }
+  return { path, undoneSeqs: undone, restored };
+}
+
 /* -------------------------------------------------------------- file read hop */
 
 export type WorkspaceFile = FileContentPayload;

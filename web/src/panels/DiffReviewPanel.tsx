@@ -19,7 +19,9 @@ import {
   isTerminalRunStatus,
   loadRunFileChanges,
   missingHopDetail,
+  restoreCheckpoint,
   type LoadRunFileChangesOptions,
+  type RestoredCheckpoint,
   type RunFileChange,
   type RunFileChanges,
 } from './workbenchContracts';
@@ -30,6 +32,8 @@ export interface DiffReviewPanelProps {
   /** Injection seam for tests and for callers that already hold the snapshot. */
   readonly loadChanges?: (runId: string) => Promise<RunFileChanges>;
   readonly loadOptions?: LoadRunFileChangesOptions;
+  /** Injection seam for tests; defaults to the real restore route. */
+  readonly restore?: (runId: string, seq: number) => Promise<RestoredCheckpoint>;
   readonly className?: string;
 }
 
@@ -43,12 +47,46 @@ export function DiffReviewPanel({
   runStatus,
   loadChanges,
   loadOptions,
+  restore,
   className,
 }: DiffReviewPanelProps) {
   const [status, setStatus] = useState<PanelStatus>('idle');
   const [data, setData] = useState<RunFileChanges | null>(null);
   const [error, setError] = useState<Refusal | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [restoreBusySeq, setRestoreBusySeq] = useState<number | null>(null);
+  const [restored, setRestored] = useState<RestoredCheckpoint | null>(null);
+  const [restoreError, setRestoreError] = useState<Refusal | null>(null);
+
+  const doRestore = useCallback(
+    async (change: RunFileChange) => {
+      if (runId === null || restoreBusySeq !== null) return;
+      setRestoreBusySeq(change.seq);
+      setRestoreError(null);
+      setRestored(null);
+      try {
+        const receipt = restore
+          ? await restore(runId, change.seq)
+          : await restoreCheckpoint(runId, change.seq, loadOptions);
+        setRestored(receipt);
+        setReloadKey((key) => key + 1);
+      } catch (failure: unknown) {
+        setRestoreError(
+          failure instanceof RefusalError
+            ? failure.refusal
+            : {
+                code: 'E_INTERNAL_ERROR',
+                message: 'Restoring the checkpoint failed.',
+                how_to_fix: 'Retry; the server refusal carries the cause.',
+                retryable: true,
+              },
+        );
+      } finally {
+        setRestoreBusySeq(null);
+      }
+    },
+    [runId, restore, loadOptions, restoreBusySeq],
+  );
 
   const load = useCallback(
     (targetRunId: string) =>
@@ -117,9 +155,13 @@ export function DiffReviewPanel({
         role="note"
         className="mt-2 rounded-[var(--radius-sm)] border border-hairline px-3 py-2 text-xs"
       >
-        <p className="font-medium">Line diff and apply/reject are unavailable.</p>
+        <p className="font-medium">Line diff and merge apply/reject are unavailable.</p>
         <p className="mt-1 opacity-80">{CONTENT_MISSING}</p>
         <p className="mt-1 opacity-80">{APPLY_MISSING}</p>
+        <p className="mt-1 opacity-80">
+          Full-file checkpoint restore is available below: the server verifies the current
+          file and the journalled before-image before writing, and refuses drift.
+        </p>
         {terminal ? (
           <p className="mt-1 opacity-80">
             This run is terminal ({runStatus}); its journal is read-only history.
@@ -156,15 +198,46 @@ export function DiffReviewPanel({
             No file changes were journalled for this run; the checkpoint journal is empty.
           </p>
         ) : (
-          <FileChangeTable changes={changes} />
+          <FileChangeTable
+            changes={changes}
+            canRestore={!terminal}
+            onRestore={(change) => {
+              void doRestore(change);
+            }}
+            busySeq={restoreBusySeq}
+          />
         )
+      ) : null}
+
+      {restored !== null ? (
+        <p role="status" className="mt-3 text-xs">
+          Restored {restored.path} to {formatFileState(restored.restored)}; undone sequence(s){' '}
+          {restored.undoneSeqs.join(', ')}.
+        </p>
+      ) : null}
+      {restoreError !== null ? (
+        <div role="alert" className="mt-3 text-xs">
+          <p className="font-medium">Restore refused · {restoreError.code}</p>
+          <p className="opacity-80">{restoreError.message}</p>
+          <p className="opacity-80">{restoreError.how_to_fix}</p>
+        </div>
       ) : null}
     </section>
   );
 }
 
 /** Pure view of the journalled changes; exported so it can be rendered alone. */
-export function FileChangeTable({ changes }: { readonly changes: readonly RunFileChange[] }) {
+export function FileChangeTable({
+  changes,
+  canRestore = false,
+  onRestore,
+  busySeq = null,
+}: {
+  readonly changes: readonly RunFileChange[];
+  readonly canRestore?: boolean;
+  readonly onRestore?: (change: RunFileChange) => void;
+  readonly busySeq?: number | null;
+}) {
   return (
     <table className="mt-3 w-full text-left text-xs">
       <caption className="sr-only">File changes journalled for this run</caption>
@@ -175,18 +248,40 @@ export function FileChangeTable({ changes }: { readonly changes: readonly RunFil
           <th scope="col">After</th>
           <th scope="col">Seq</th>
           <th scope="col">Journalled at</th>
+          {canRestore ? <th scope="col">Action</th> : null}
         </tr>
       </thead>
       <tbody>
         {changes.map((change) => (
-          <FileChangeRow key={`${change.runId}-${change.seq}`} change={change} />
+          <FileChangeRow
+            key={`${change.runId}-${change.seq}`}
+            change={change}
+            canRestore={canRestore}
+            onRestore={onRestore}
+            busy={busySeq === change.seq}
+            anyBusy={busySeq !== null}
+          />
         ))}
       </tbody>
     </table>
   );
 }
 
-function FileChangeRow({ change }: { readonly change: RunFileChange }) {
+function FileChangeRow({
+  change,
+  canRestore,
+  onRestore,
+  busy,
+  anyBusy,
+}: {
+  readonly change: RunFileChange;
+  readonly canRestore: boolean;
+  readonly onRestore?: (change: RunFileChange) => void;
+  readonly busy: boolean;
+  readonly anyBusy: boolean;
+}) {
+  const [confirm, setConfirm] = useState(false);
+  const actionable = canRestore && change.after !== null && onRestore !== undefined;
   return (
     <tr className="border-t border-hairline">
       <td className="py-1 font-mono">{change.path}</td>
@@ -197,6 +292,29 @@ function FileChangeRow({ change }: { readonly change: RunFileChange }) {
       </td>
       <td className="py-1">{change.seq}</td>
       <td className="py-1">{change.createdAt}</td>
+      {canRestore ? (
+        <td className="py-1">
+          {actionable ? (
+            <button
+              type="button"
+              disabled={anyBusy}
+              className="rounded-[var(--radius-sm)] border border-hairline px-2 py-1 disabled:opacity-50"
+              onClick={() => {
+                if (!confirm) {
+                  setConfirm(true);
+                  return;
+                }
+                setConfirm(false);
+                onRestore(change);
+              }}
+            >
+              {busy ? 'Restoring…' : confirm ? 'Confirm restore' : 'Restore'}
+            </button>
+          ) : (
+            <span className="opacity-60">not recorded</span>
+          )}
+        </td>
+      ) : null}
     </tr>
   );
 }
