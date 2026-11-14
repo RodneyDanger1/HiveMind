@@ -460,6 +460,7 @@ function CanvasInner() {
       ref={canvasRef}
       className="relative h-full min-h-0 w-full"
       style={{
+        paddingTop: '56px',
         paddingBottom: chatVisible ? 'var(--chat-dock-height, 0px)' : undefined,
         transition: 'padding-bottom 180ms ease',
       }}

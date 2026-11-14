@@ -40,6 +40,8 @@ agent run list, and the completed three-SuperAgent run detail.
 
 ![HiveMind Help & Tutorials — first-run, dock, and safety guidance](docs/evidence/screenshots/hivemind-help.png)
 
+![HiveMind approval card — shell_exec request with approve/deny and expiry](docs/evidence/screenshots/hivemind-approval.png)
+
 ## Capability status (wired vs library-only)
 
 These are the current boundaries, not a feature wish-list:
