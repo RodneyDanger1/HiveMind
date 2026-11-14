@@ -615,7 +615,7 @@ function CanvasInner() {
         aria-hidden="true"
         className="pointer-events-none absolute inset-0 z-0 overflow-hidden"
       >
-        <div className="absolute left-1/2 top-1/2 h-[660px] w-[620px] -translate-x-1/2 -translate-y-1/2 opacity-90">
+        <div className="absolute left-1/2 top-1/2 h-[520px] w-[500px] -translate-x-1/2 -translate-y-1/2 opacity-90">
           <HiveField />
         </div>
       </div>
