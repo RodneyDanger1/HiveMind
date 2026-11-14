@@ -354,7 +354,9 @@ export function FileTree({
     >
       <header className="flex flex-wrap items-center gap-2 border-b border-hairline bg-panel-alt px-3 py-2">
         <div className="flex min-w-0 flex-1 items-baseline gap-2">
-          <h2 className="type-label text-ink-900">{FILE_TREE_COPY.section}</h2>
+          <h2 className="type-label shrink-0 whitespace-nowrap text-ink-900">
+            {FILE_TREE_COPY.section}
+          </h2>
           <span className="type-mono-meta truncate text-meta" title={root ?? undefined}>
             {root ?? FILE_TREE_COPY.root}
           </span>
@@ -365,7 +367,7 @@ export function FileTree({
         </span>
         <button
           type="button"
-          className="type-mono-meta rounded-[var(--radius-sm)] border border-hairline bg-panel px-2 py-1 text-ink-800 hover:bg-honey-100 disabled:cursor-not-allowed disabled:opacity-50"
+          className="type-mono-meta shrink-0 whitespace-nowrap rounded-[var(--radius-sm)] border border-hairline bg-panel px-2 py-1 text-ink-800 hover:bg-honey-100 disabled:cursor-not-allowed disabled:opacity-50"
           aria-label={FILE_TREE_COPY.refresh}
           disabled={onRefresh === undefined || status === 'loading'}
           onClick={() => onRefresh?.()}
