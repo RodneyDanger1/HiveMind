@@ -27,12 +27,14 @@ use crate::tool_loop::{ToolCallPlan, ToolExecution};
 
 const PLANNER_SYSTEM: &str = "You are the HiveMind planner. Return ONE JSON object only, \
 no markdown fences, no prose. Schema: {\"nodes\":[{\"id\":\"n1\",\"role\":\"superagent\",\
-\"deps\":[],\"depth\":1}]}. Use short string ids; every dep must be the id of another node; \
-depth must be >= 1 and <= 3. Strict hierarchy: depth 1 nodes are superagent branch leads; \
-workers (agents) may only be depth 2 under a superagent; subagents may only be depth 3 \
-under a worker. Never place worker or subagent at depth 1. If the user specifies exact \
-counts, roles, or topology, honor them exactly and do not add extra branch leads. Produce \
-the smallest useful DAG (1..=8 nodes).";
+\"deps\":[],\"depth\":1,\"parent\":null,\"objective\":\"one sentence naming this seat's deliverable\"}]}. \
+Every node MUST carry its own plain-English objective (8-600 chars) naming exactly that seat's \
+deliverable and return value; never paste the whole run prompt into a seat objective. Use short \
+string ids; every dep must be the id of another node; depth must be >= 1 and <= 3. Strict hierarchy: \
+depth 1 nodes are superagent branch leads; workers (agents) may only be depth 2 under a superagent; \
+subagents may only be depth 3 under a worker. Never place worker or subagent at depth 1. If the \
+user specifies exact counts, roles, or topology, honor them exactly and do not add extra branch \
+leads. Produce the smallest useful DAG (1..=8 nodes).";
 
 const TASK_SYSTEM: &str = "You are a HiveMind agent. Answer the assigned task directly and \
 concisely. Inspect before editing, prefer the smallest correct change, and after any mutation \
@@ -1036,6 +1038,9 @@ struct WireNode {
     /// Planned parent id. Omitted means the run root (legacy flat plans).
     #[serde(default)]
     parent: Option<String>,
+    /// Plain-English objective for this seat.
+    #[serde(default)]
+    objective: Option<String>,
 }
 
 const fn one() -> u8 {
@@ -1085,12 +1090,17 @@ impl WirePlan {
             if let Some(parent_id) = parent {
                 deps.retain(|dep| *dep != parent_id);
             }
+            let objective = node
+                .objective
+                .map(|objective| objective.trim().to_owned())
+                .filter(|objective| !objective.is_empty());
             nodes.push(PlanNode {
                 node_id,
                 role: node.role,
                 deps,
                 depth: node.depth,
                 parent,
+                objective,
             });
         }
         let plan = Plan::new(nodes);
@@ -1242,6 +1252,7 @@ mod tests {
         let wire = WirePlan {
             nodes: vec![
                 WireNode {
+                    objective: None,
                     id: "a".to_owned(),
                     role: "worker".to_owned(),
                     deps: vec![],
@@ -1249,6 +1260,7 @@ mod tests {
                     parent: None,
                 },
                 WireNode {
+                    objective: None,
                     id: "a".to_owned(),
                     role: "worker".to_owned(),
                     deps: vec![],
@@ -1265,6 +1277,7 @@ mod tests {
         let wire = WirePlan {
             nodes: vec![
                 WireNode {
+                    objective: None,
                     id: "a".to_owned(),
                     role: "super".to_owned(),
                     deps: vec![],
@@ -1272,6 +1285,7 @@ mod tests {
                     parent: None,
                 },
                 WireNode {
+                    objective: None,
                     id: "b".to_owned(),
                     role: "worker".to_owned(),
                     deps: vec!["a".to_owned()],
@@ -1298,6 +1312,7 @@ mod tests {
         let wire = WirePlan {
             nodes: vec![
                 WireNode {
+                    objective: None,
                     id: "super".to_owned(),
                     role: "super".to_owned(),
                     deps: vec![],
@@ -1305,6 +1320,7 @@ mod tests {
                     parent: None,
                 },
                 WireNode {
+                    objective: None,
                     id: "worker".to_owned(),
                     role: "worker".to_owned(),
                     deps: vec!["super".to_owned()],
@@ -1323,6 +1339,7 @@ mod tests {
         let wire = WirePlan {
             nodes: vec![
                 WireNode {
+                    objective: None,
                     id: "super".to_owned(),
                     role: "super".to_owned(),
                     deps: vec![],
@@ -1330,6 +1347,7 @@ mod tests {
                     parent: None,
                 },
                 WireNode {
+                    objective: None,
                     id: "worker".to_owned(),
                     role: "worker".to_owned(),
                     deps: vec![],
@@ -1346,6 +1364,7 @@ mod tests {
     fn wire_plan_rejects_unknown_parent() {
         let wire = WirePlan {
             nodes: vec![WireNode {
+                objective: None,
                 id: "worker".to_owned(),
                 role: "worker".to_owned(),
                 deps: vec![],

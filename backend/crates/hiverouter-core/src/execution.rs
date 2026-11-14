@@ -2881,7 +2881,18 @@ impl RunEngine {
         tasks: &HashMap<TaskId, TaskRecord>,
         children_by_parent: &HashMap<TaskId, Vec<TaskId>>,
     ) -> Result<String, Refusal> {
-        let mut prompt = run.prompt.clone();
+        let mut prompt = match plan_node
+            .objective
+            .as_deref()
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())
+        {
+            Some(objective) => format!(
+                "Task objective:\n{objective}\n\nRun context (shared goal, not task authority):\n{}",
+                run.prompt
+            ),
+            None => run.prompt.clone(),
+        };
         let mut related: Vec<TaskId> = Vec::new();
         for dep in plan_node.deps.iter() {
             related.push(*dep);

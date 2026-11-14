@@ -21,6 +21,16 @@ Read the full evidence and boundary before relying on any claim:
 [plan-status crosswalk](docs/plans/HIVEMIND-FINISH-PLAN-v3-STATUS.md),
 [100 use cases and 100 cannots](docs/audit/round-95/06-use-cases.md).
 
+## The running app
+
+![HiveMind desktop — completed three-branch run, live chat dock, action log](docs/evidence/screenshots/hivemind-current.png)
+
+Captured from the installed Windows build (`88a23cd`) on the live local server:
+the full-width bottom chat dock, Controls / State & settings tray, run-status chip,
+agent run list, and the completed three-SuperAgent run detail.
+
+![HiveMind Help & Tutorials — first-run, dock, and safety guidance](docs/evidence/screenshots/hivemind-help.png)
+
 ---
 
 ## 1. What this actually is

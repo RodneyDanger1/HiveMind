@@ -77,6 +77,7 @@ fn plan() -> Plan {
     let mut nodes = Vec::new();
     for _ in 0..8 {
         let branch = PlanNode {
+            objective: None,
             node_id: TaskId::new(),
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -85,6 +86,7 @@ fn plan() -> Plan {
         };
         for _ in 0..4 {
             nodes.push(PlanNode {
+                objective: None,
                 node_id: TaskId::new(),
                 role: "worker".to_owned(),
                 deps: Vec::new(),

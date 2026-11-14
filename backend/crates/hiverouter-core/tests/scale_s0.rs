@@ -71,6 +71,7 @@ async fn probe(nodes: usize) -> (u64, usize, usize) {
     let plan = Plan::new(
         (0..nodes)
             .map(|_| PlanNode {
+                objective: None,
                 node_id: TaskId::new(),
                 role: "super".to_owned(),
                 deps: Vec::new(),

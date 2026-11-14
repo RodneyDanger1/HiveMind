@@ -28,6 +28,7 @@ fn render_planner(task: &str) -> Vec<hiverouter_core::prompts::RenderedMessage> 
 
 fn node(role: &str, depth: u8) -> PlanNode {
     PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: role.to_owned(),
         deps: Vec::new(),
@@ -38,6 +39,7 @@ fn node(role: &str, depth: u8) -> PlanNode {
 
 fn child(role: &str, depth: u8, parent: TaskId) -> PlanNode {
     PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: role.to_owned(),
         deps: Vec::new(),

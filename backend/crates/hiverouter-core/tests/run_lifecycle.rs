@@ -30,6 +30,7 @@ use uuid::Uuid;
 fn leaf_plan(count: usize, depth: u8) -> Plan {
     let nodes = (0..count)
         .map(|_| PlanNode {
+            objective: None,
             node_id: TaskId::new(),
             // Strict hierarchy: a HyperAgent may only spawn SuperAgent branch
             // leads; a direct worker plan would be a named refusal.
@@ -44,6 +45,7 @@ fn leaf_plan(count: usize, depth: u8) -> Plan {
 
 fn tree_plan() -> Plan {
     let super_agent = PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: "super".to_owned(),
         deps: Vec::new(),
@@ -51,6 +53,7 @@ fn tree_plan() -> Plan {
         parent: None,
     };
     let agent = PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: "worker".to_owned(),
         deps: Vec::new(),
@@ -58,6 +61,7 @@ fn tree_plan() -> Plan {
         parent: Some(super_agent.node_id),
     };
     let subagent = PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: "subagent".to_owned(),
         deps: Vec::new(),
@@ -934,6 +938,7 @@ async fn unknown_spawn_role_is_refused_by_name() {
 #[tokio::test]
 async fn strict_hierarchy_refuses_direct_hyper_agent_and_super_subagent_edges() {
     let direct_agent = Plan::new(vec![PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: "worker".to_owned(),
         deps: Vec::new(),

@@ -65,6 +65,11 @@ pub struct PlanNode {
     /// When present, the parent must be another planned node at `depth - 1`.
     #[serde(default)]
     pub parent: Option<TaskId>,
+    /// Plain-English objective for this seat. The executor gives each seat its
+    /// own brief instead of the whole run prompt; `None` keeps the legacy
+    /// whole-prompt fallback for plans that predate objectives.
+    #[serde(default)]
+    pub objective: Option<String>,
 }
 
 /// One plan: an acyclic DAG of nodes.
@@ -320,6 +325,7 @@ mod tests {
 
     fn node(role: &str, deps: Vec<TaskId>, depth: u8) -> PlanNode {
         PlanNode {
+            objective: None,
             node_id: TaskId::new(),
             role: role.to_owned(),
             deps,

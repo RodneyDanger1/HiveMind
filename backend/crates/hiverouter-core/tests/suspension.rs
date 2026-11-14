@@ -82,6 +82,7 @@ const WRITE_TEXT: &str = "HIVE-APPROVAL-OK";
 
 fn leaf_plan() -> Plan {
     Plan::new(vec![PlanNode {
+        objective: None,
         node_id: TaskId::new(),
         role: "super".to_owned(),
         deps: Vec::new(),
@@ -528,6 +529,7 @@ async fn cross_branch_message_requires_approval_then_writes_once() {
     let worker_b = TaskId::new();
     let plan = Plan::new(vec![
         PlanNode {
+            objective: None,
             node_id: super_a,
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -535,6 +537,7 @@ async fn cross_branch_message_requires_approval_then_writes_once() {
             parent: None,
         },
         PlanNode {
+            objective: None,
             node_id: super_b,
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -542,6 +545,7 @@ async fn cross_branch_message_requires_approval_then_writes_once() {
             parent: None,
         },
         PlanNode {
+            objective: None,
             node_id: worker_a,
             role: "worker".to_owned(),
             deps: Vec::new(),
@@ -549,6 +553,7 @@ async fn cross_branch_message_requires_approval_then_writes_once() {
             parent: Some(super_a),
         },
         PlanNode {
+            objective: None,
             node_id: worker_b,
             role: "worker".to_owned(),
             deps: Vec::new(),
@@ -1125,6 +1130,7 @@ async fn concurrent_tasks_do_not_double_suspend_the_run() {
     let b = TaskId::new();
     let plan = Plan::new(vec![
         PlanNode {
+            objective: None,
             node_id: a,
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -1132,6 +1138,7 @@ async fn concurrent_tasks_do_not_double_suspend_the_run() {
             parent: None,
         },
         PlanNode {
+            objective: None,
             node_id: b,
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -1285,6 +1292,7 @@ async fn inline_parent_answer_is_persisted_without_operator_approval() {
     let child = TaskId::new();
     let plan = Plan::new(vec![
         PlanNode {
+            objective: None,
             node_id: parent,
             role: "super".to_owned(),
             deps: Vec::new(),
@@ -1292,6 +1300,7 @@ async fn inline_parent_answer_is_persisted_without_operator_approval() {
             parent: None,
         },
         PlanNode {
+            objective: None,
             node_id: child,
             role: "worker".to_owned(),
             deps: Vec::new(),
