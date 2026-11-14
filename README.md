@@ -52,11 +52,11 @@ These are the current boundaries, not a feature wish-list:
   DAGs with per-seat objectives, approvals, run history, tool calls (`file_read`, `fs_glob`,
   `fs_grep`, `file_read_range`, `apply_patch`, `run_tests`, git read/write tools,
   `shell_exec`, `harness_diagnose`), workspace jail with data-file denies, `/api/logs`,
-  `/diagnose`, repo symbol search (`repo_search`), session-scoped run seeding (cross-run memory), the MCP stdio server in
+  `/diagnose`, repo symbol search (`repo_search`), ranked memory recall (`memory_recall`), session-scoped run seeding (cross-run memory), the MCP stdio server in
   `tools/hivemind-mcp`, and the workbench UI panels.
 - **Library primitives wired into the crate, not yet exposed as agent tools/routes:**
   per-tree chat bus (`chat_bus.rs`), delegation seat protocol (`delegation_protocol.rs`),
-  lexical semantic recall (`semantic_recall.rs`), HiveWire in-process queue + lease
+  HiveWire in-process queue + lease
   scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), repository symbol primitives
   (`repo_index.rs`). The session model is
   wired for run seeding; it has no separate resume HTTP route yet.
