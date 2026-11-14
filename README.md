@@ -10,7 +10,7 @@ version remains the release authority; the working tree is pre-release and unsea
 
 **Truth baseline (observed 2026-11-12, integration branch):** capability work is
 on `integration/capability-absorb`; schema is **v32** (sessions/policy, repo index,
-checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **23 tools / 85 grants / 80 named refusals**;
+checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **24 tools / 89 grants / 80 named refusals**;
 `/health` is `ok` on a configured profile; docs truth checker **19/19 PASS**; the
 full backend workspace gate and the full web gate pass. This is **pre-release**
 work, not a clean release seal; the sealed `1.1.0` remains the release authority.
@@ -48,13 +48,13 @@ These are the current boundaries, not a feature wish-list:
   DAGs with per-seat objectives, approvals, run history, tool calls (`file_read`, `fs_glob`,
   `fs_grep`, `file_read_range`, `apply_patch`, `run_tests`, git read/write tools,
   `shell_exec`, `harness_diagnose`), workspace jail with data-file denies, `/api/logs`,
-  `/diagnose`, session-scoped run seeding (cross-run memory), the MCP stdio server in
+  `/diagnose`, repo symbol search (`repo_search`), session-scoped run seeding (cross-run memory), the MCP stdio server in
   `tools/hivemind-mcp`, and the workbench UI panels.
 - **Library primitives wired into the crate, not yet exposed as agent tools/routes:**
   per-tree chat bus (`chat_bus.rs`), delegation seat protocol (`delegation_protocol.rs`),
   lexical semantic recall (`semantic_recall.rs`), HiveWire in-process queue + lease
   scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), file-checkpoint restore
-  and repository symbol search (`checkpoint.rs`/`repo_index.rs`). The session model is
+  (`checkpoint.rs`/`repo_index.rs`). The session model is
   wired for run seeding; it has no separate resume HTTP route yet.
 - **Not present:** autonomous coding/self-modification, a continuous daemon, OS
   filesystem/network sandboxing, network remote transport, embeddings/ANN, automatic
