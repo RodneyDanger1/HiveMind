@@ -12,7 +12,6 @@ import {
   ReactFlowProvider,
   useReactFlow,
   useViewport,
-  ViewportPortal,
   type Edge,
   type Node,
   type NodeTypes,
@@ -612,6 +611,14 @@ function CanvasInner() {
           RUN · {runLabel}
         </span>
       </div>
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 z-0 overflow-hidden"
+      >
+        <div className="absolute left-1/2 top-1/2 h-[660px] w-[620px] -translate-x-1/2 -translate-y-1/2 opacity-90">
+          <HiveField />
+        </div>
+      </div>
       <ReactFlow
         nodes={history.replayGraph ? replayNodes : liveNodes}
         edges={history.replayGraph ? replayEdges : edges}
@@ -662,15 +669,6 @@ function CanvasInner() {
         fitViewOptions={{ padding: 0.08, minZoom: 0.75, maxZoom: 0.75 }}
         className="h-full w-full bg-transparent"
       >
-        <ViewportPortal>
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute"
-            style={{ left: -310, top: -330, width: 620, height: 660 }}
-          >
-            <HiveField center={false} />
-          </div>
-        </ViewportPortal>
         <MiniMap
           pannable
           zoomable
