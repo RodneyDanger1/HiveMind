@@ -48,7 +48,7 @@ agent run list, and the completed three-SuperAgent run detail.
 
 These are the current boundaries, not a feature wish-list:
 
-- **Wired and exercised:** local server + SQLite, planner → HyperAgent → SuperAgent → worker
+- **Wired and exercised:** local server + SQLite, full-file checkpoint restore in the Data surface (list + two-step restore), planner → HyperAgent → SuperAgent → worker
   DAGs with per-seat objectives, approvals, run history, tool calls (`file_read`, `fs_glob`,
   `fs_grep`, `file_read_range`, `apply_patch`, `run_tests`, git read/write tools,
   `shell_exec`, `harness_diagnose`), workspace jail with data-file denies, `/api/logs`,
@@ -57,8 +57,8 @@ These are the current boundaries, not a feature wish-list:
 - **Library primitives wired into the crate, not yet exposed as agent tools/routes:**
   per-tree chat bus (`chat_bus.rs`), delegation seat protocol (`delegation_protocol.rs`),
   lexical semantic recall (`semantic_recall.rs`), HiveWire in-process queue + lease
-  scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), file-checkpoint restore
-  (`checkpoint.rs`/`repo_index.rs`). The session model is
+  scheduler (`hivewire.rs`/`remote_store.rs`/`daemon_store.rs`), repository symbol primitives
+  (`repo_index.rs`). The session model is
   wired for run seeding; it has no separate resume HTTP route yet.
 - **Not present:** autonomous coding/self-modification, a continuous daemon, OS
   filesystem/network sandboxing, network remote transport, embeddings/ANN, automatic
