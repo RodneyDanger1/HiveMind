@@ -92,7 +92,7 @@ pub use shell::{
 };
 pub use settings::{require_provider_key, settings_status};
 pub use tool::{
-    AgentTier, AskParentArgs, FinishArgs, FileListArgs, FileReadArgs, FileWriteArgs, HarnessDiagnoseArgs,
+    AgentTier, AskParentArgs, FinishArgs, FileListArgs, FileReadArgs, FileWriteArgs, HarnessDiagnoseArgs, RepoSearchArgs,
     PermissionClass, ReportResultArgs, SendToSiblingArgs, ShellExecArgs, SpawnAgentArgs,
     ToolContract, ToolId, ToolRegistry,
 };

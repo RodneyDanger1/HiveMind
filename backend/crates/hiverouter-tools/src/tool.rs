@@ -159,6 +159,8 @@ pub enum ToolId {
     GitLog,
     /// Read the harness's own health, log metadata, and refusal diagnostics.
     HarnessDiagnose,
+    /// Search the repository symbol index by name/kind.
+    RepoSearch,
 }
 
 impl ToolId {
@@ -189,6 +191,7 @@ impl ToolId {
             ToolId::GitDiff => "git_diff",
             ToolId::GitLog => "git_log",
             ToolId::HarnessDiagnose => "harness_diagnose",
+            ToolId::RepoSearch => "repo_search",
         }
     }
 
@@ -383,6 +386,20 @@ pub struct HarnessDiagnoseArgs {
 
 fn default_diagnose_scope() -> String {
     "all".to_owned()
+}
+
+/// Arguments for [`ToolId::RepoSearch`].
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepoSearchArgs {
+    /// Symbol name fragment (2..=256 bytes).
+    pub query: String,
+    /// Optional symbol kind (`function`, `struct`, `class`, ...).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Maximum hits (1..=50).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Arguments for [`ToolId::FileRead`].
@@ -769,6 +786,12 @@ impl ToolRegistry {
                 PermissionClass::Read,
                 schema_of!(HarnessDiagnoseArgs),
             ),
+            contract(
+                ToolId::RepoSearch,
+                "Search the repository symbol index by symbol name and optional kind. Read-only; returns path, line, kind, and signature.",
+                PermissionClass::Read,
+                schema_of!(RepoSearchArgs),
+            ),
         ] {
             contracts.insert(contract.id, contract);
         }
@@ -791,6 +814,7 @@ impl ToolRegistry {
                 ToolId::GitDiff,
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
+                ToolId::RepoSearch,
             ],
         );
         allowlists.insert(
@@ -819,6 +843,7 @@ impl ToolRegistry {
                 ToolId::GitDiff,
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
+                ToolId::RepoSearch,
             ],
         );
         allowlists.insert(
@@ -846,6 +871,7 @@ impl ToolRegistry {
                 ToolId::GitDiff,
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
+                ToolId::RepoSearch,
             ],
         );
         allowlists.insert(
@@ -863,6 +889,7 @@ impl ToolRegistry {
                 ToolId::GitDiff,
                 ToolId::GitLog,
                 ToolId::HarnessDiagnose,
+                ToolId::RepoSearch,
             ],
         );
         allowlists.insert(

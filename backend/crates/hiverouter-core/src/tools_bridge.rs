@@ -1322,6 +1322,54 @@ impl ToolsBridge {
         }))
     }
 
+    /// Read-only repository symbol search over the persisted repo index.
+    ///
+    /// Returns only name/kind/path/line/signature, never file bodies. A query
+    /// or kind rejected by the index is a named schema refusal.
+    ///
+    /// # Errors
+    /// `E_SCHEMA_INVALID` for an invalid query/kind/limit; `E_INTERNAL_ERROR`
+    /// when the index cannot be read.
+    pub fn repo_search(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<serde_json::Value, Refusal> {
+        let root = self.workspace_root.clone();
+        let hits = self
+            .db
+            .with_connection_refusal(|connection| {
+                crate::repo_index::search_workspace_symbols(connection, &root, query, kind, limit)
+                    .map_err(|error| match error {
+                        crate::repo_index::RepoIndexError::InvalidQuery(_)
+                        | crate::repo_index::RepoIndexError::InvalidLimit { .. } => {
+                            Refusal::SchemaInvalid
+                        }
+                        _ => Refusal::InternalError,
+                    })
+            })?;
+        let rows: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "name": hit.name,
+                    "kind": hit.kind,
+                    "path": hit.rel_path,
+                    "line": hit.line,
+                    "signature": hit.signature,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "schema": "hiverouter.repo_search.v1",
+            "query": query,
+            "kind": kind,
+            "count": rows.len(),
+            "hits": rows,
+        }))
+    }
+
     /// Sorted, bounded names of the workspace root entries for path diagnosis.
     ///
     /// Only names (directories suffixed with `/`) — never file bodies, sizes or

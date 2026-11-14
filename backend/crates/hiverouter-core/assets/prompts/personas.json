@@ -22,7 +22,7 @@
     "display_name": "HiveMind SuperAgent",
     "tier": "super",
     "template_id": "superagent",
-    "allowed_tool_ids": ["spawn_agent", "ask_parent", "send_to_sibling", "file_read", "file_list", "report_result", "finish", "request_detached", "web_fetch", "vote_evolution", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose"],
+    "allowed_tool_ids": ["spawn_agent", "ask_parent", "send_to_sibling", "file_read", "file_list", "report_result", "finish", "request_detached", "web_fetch", "vote_evolution", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search"],
     "output_schema_id": null,
     "refusal_policy": "strict",
     "max_children": 8,
@@ -33,7 +33,7 @@
     "display_name": "HiveMind Subagent",
     "tier": "worker",
     "template_id": "subagent",
-    "allowed_tool_ids": ["ask_parent", "file_read", "file_list", "report_result", "finish", "fs_glob", "fs_grep", "file_read_range", "git_status", "git_diff", "git_log", "harness_diagnose"],
+    "allowed_tool_ids": ["ask_parent", "file_read", "file_list", "report_result", "finish", "fs_glob", "fs_grep", "file_read_range", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },
@@ -51,7 +51,7 @@
     "display_name": "Code Reviewer",
     "tier": "worker",
     "template_id": "code-reviewer",
-    "allowed_tool_ids": ["file_read", "file_list", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch", "fs_glob", "fs_grep", "file_read_range", "git_status", "git_diff", "git_log", "harness_diagnose"],
+    "allowed_tool_ids": ["file_read", "file_list", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch", "fs_glob", "fs_grep", "file_read_range", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },
@@ -69,7 +69,7 @@
     "display_name": "HiveMind Agent",
     "tier": "worker",
     "template_id": "agent",
-    "allowed_tool_ids": ["file_read", "file_list", "file_write", "shell_exec", "ask_parent", "send_to_sibling", "spawn_agent", "report_result", "finish", "request_detached", "web_fetch", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose"],
+    "allowed_tool_ids": ["file_read", "file_list", "file_write", "shell_exec", "ask_parent", "send_to_sibling", "spawn_agent", "report_result", "finish", "request_detached", "web_fetch", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   }

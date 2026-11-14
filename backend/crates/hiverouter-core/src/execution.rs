@@ -24,8 +24,8 @@ use hiverouter_tools::approval::{ApprovalDecision, ApprovalResolution};
 use hiverouter_tools::shell::ShellPolicy;
 use hiverouter_tools::{
     execute_read_only, AgentTier, AskParentArgs, ExecutedTool as ToolsExecutedTool,
-    HarnessDiagnoseArgs, PermissionClass, SendToSiblingArgs, SpawnAgentArgs, ToolId, ToolRegistry,
-    WorkspaceJail,
+    HarnessDiagnoseArgs, PermissionClass, RepoSearchArgs, SendToSiblingArgs, SpawnAgentArgs, ToolId,
+    ToolRegistry, WorkspaceJail,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -3679,6 +3679,40 @@ impl RunEngine {
                     plan.tool_call_id.clone(),
                     refusal.code(),
                     "harness_diagnose refused the requested diagnostic scope".to_owned(),
+                ),
+            };
+        }
+        if plan.tool == ToolId::RepoSearch.id() {
+            let Some(tools) = self.tools.as_ref() else {
+                return ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    Refusal::FileTreeUnavailable.code(),
+                    "the repository index bridge is unavailable; nothing was read".to_owned(),
+                );
+            };
+            let args: RepoSearchArgs = match serde_json::from_value(plan.args.clone()) {
+                Ok(args) => args,
+                Err(_) => {
+                    return ToolExecution::refused(
+                        plan.tool_call_id.clone(),
+                        Refusal::SchemaInvalid.code(),
+                        "repo_search arguments did not match {query,kind?,limit?}".to_owned(),
+                    );
+                }
+            };
+            return match tools.repo_search(
+                &args.query,
+                args.kind.as_deref(),
+                args.limit.unwrap_or(20).clamp(1, 50),
+            ) {
+                Ok(value) => ToolExecution::ok(
+                    plan.tool_call_id.clone(),
+                    tool_loop::bounded_tool_text(&value.to_string()),
+                ),
+                Err(refusal) => ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    refusal.code(),
+                    "repo_search refused the requested symbol query".to_owned(),
                 ),
             };
         }
