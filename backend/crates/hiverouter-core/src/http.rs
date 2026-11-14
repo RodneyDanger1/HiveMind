@@ -698,6 +698,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(session_resume),
         )
         .route(
+            "/api/sessions/{session_id}/continue",
+            post(session_continue),
+        )
+        .route(
             "/api/sessions/{session_id}/archive",
             post(session_archive),
         )
@@ -1179,6 +1183,58 @@ async fn session_resume(
         })),
     )
         .into_response()
+}
+
+/// Submits a new run in an existing session, seeded with that session's
+/// bounded prior context. The run is asynchronous; the response carries the
+/// created run so a caller can follow it by id.
+async fn session_continue(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let store = crate::store::RunStore::new(state.db.clone());
+    let session = match store.session(&session_id) {
+        Ok(session) => session,
+        Err(refusal) => return refusal_response(StatusCode::NOT_FOUND, &refusal),
+    };
+    if session.archived_at.is_some() {
+        return refusal_response(StatusCode::CONFLICT, &Refusal::DecisionRequired);
+    }
+    let Some(prompt) = body
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    else {
+        return refusal_response(StatusCode::BAD_REQUEST, &Refusal::PromptEmpty);
+    };
+    match state
+        .engine
+        .submit_prompt_scoped(prompt, &session.project_id, Some(&session.id), None, Uuid::now_v7())
+    {
+        Ok(run) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "session": session,
+                "run": run,
+                "continuation": {
+                    "mode": "new_run_same_session",
+                    "seeded_with_prior_context": true,
+                }
+            })),
+        )
+            .into_response(),
+        Err(refusal) => {
+            let status = match refusal {
+                Refusal::RunActive => StatusCode::CONFLICT,
+                Refusal::PromptEmpty | Refusal::PromptTooLong => StatusCode::BAD_REQUEST,
+                Refusal::KeyMissing => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            refusal_response(status, &refusal)
+        }
+    }
 }
 
 async fn session_archive(
