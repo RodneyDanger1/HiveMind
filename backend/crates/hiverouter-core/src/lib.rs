@@ -11,7 +11,10 @@ pub mod caps;
 pub mod chat_bus;
 pub mod checkpoint;
 pub mod delegation_protocol;
+pub mod embeddings;
+pub mod goal_loop;
 pub mod hivewire;
+
 pub mod jobs;
 pub mod semantic_recall;
 pub mod session_model;

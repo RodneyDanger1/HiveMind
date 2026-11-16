@@ -11,30 +11,55 @@
 //!
 //! # Exact transport (do not overclaim)
 //!
-//! This build has **no network transport**. Delivery is a direct in-process
-//! call on the same host: the caller holds the [`HiveWireStore`] and passes a
-//! [`WireEnvelope`] to [`HiveWireStore::accept`]. The only accepted endpoint
-//! scheme is `inproc://<hive>/<remote>`; anything else is refused with
+//! Two delivery paths exist and both are real:
+//!
+//! * **Loopback WebSocket** — [`ws::HiveWireTransport`] serves
+//!   `GET /api/hivewire/ws` as a real axum upgrade handler. The listener is
+//!   expected to be bound to a loopback address; the handler additionally
+//!   refuses any non-loopback peer. Authentication is `Authorization: Bearer
+//!   <launch token>`, compared in constant time against the stored SHA-256
+//!   digest before the upgrade. Every frame is one versioned JSON envelope:
+//!   client frames are [`WireEnvelope`], server frames are [`ServerEnvelope`].
+//!   The handshake has a 5 s deadline, an idle connection is closed after 30 s,
+//!   and a frame above [`MAX_FRAME_BYTES`] is refused by name.
+//! * **In-process** — [`HiveWireStore::accept`] can be called directly by a
+//!   caller that already holds the store (tests, same-process workers).
+//!
+//! There is **no TLS**. `wss://` is refused as an unsupported transport instead
+//! of pretending to be secure; only `ws://` with a loopback host and
+//! `inproc://<hive>/<remote>` are accepted endpoint schemes. A remote scheme
+//! (`http://`, `https://`, `wss://`, a non-loopback `ws://`) is refused with
 //! [`HiveWireError::UnsupportedTransport`] rather than silently "succeeding".
 //! The messages and leases are durable in SQLite, so the daemon scheduler sees
-//! the same tickets after a process restart. A TCP/WebSocket listener is *not*
-//! implemented here (the HTTP/WS owners are outside this change's scope).
+//! the same tickets after a process restart.
 //!
 //! # Wiring
 //!
-//! The crate root is outside this change's write scope, so `src/lib.rs` does not
-//! yet declare `pub mod hivewire;`. Every path in these three files uses
-//! `crate::`-relative imports only, so the module compiles unchanged once that
-//! one line is added. Until then the integration tests mount it with
-//! `#[path = "../src/hivewire.rs"] mod hivewire;` (the test crate re-exports
-//! `hiverouter_core::db` at its root so `crate::db` resolves in both contexts).
+//! `src/lib.rs` already declares `pub mod hivewire;`. The HTTP owner (out of
+//! this change's write scope) mounts the transport with either of:
+//!
+//! ```ignore
+//! // state-agnostic handler (works with any router state, before or after
+//! // `with_state`):
+//! .route(hivewire::HIVEWIRE_WS_PATH, get(hivewire::ws::handler(transport)))
+//! // or a complete router to merge into a `Router<()>`:
+//! let app = app.merge(hivewire::ws::router(transport));
+//! ```
+//!
+//! The serve call must use `into_make_service_with_connect_info::<SocketAddr>()`
+//! because the handler refuses a non-loopback peer. The transport owns the
+//! [`HiveWireStore`], and the daemon scheduler is built on the same database:
+//! `DaemonScheduler::new(store.database().clone(), ...)`.
 //!
 //! # Schema
 //!
 //! [`remote_store::ensure_schema`] creates the additive `hivewire_*` tables with
-//! `CREATE TABLE IF NOT EXISTS`. This is deliberately *not* added to
-//! [`crate::db::MIGRATIONS`] because that file is out of scope; the tables are
-//! independent of the existing tables and the DDL is idempotent.
+//! `CREATE TABLE IF NOT EXISTS`. It is idempotent on every open and also adds
+//! columns introduced after a table already existed. [`remote_store::SCHEMA_V33`]
+//! is the exact same DDL frozen for the ordered migration list: the `db.rs`
+//! owner appends `Migration { version: 33, name: "hivewire", up:
+//! remote_store::SCHEMA_V33, down: remote_store::SCHEMA_V33_DOWN }`; this module
+//! does not edit `db.rs` itself.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,29 +68,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 
-#[path = "remote_store.rs"]
-pub mod remote_store;
 #[path = "daemon_store.rs"]
 pub mod daemon_store;
+#[path = "remote_store.rs"]
+pub mod remote_store;
+#[path = "hivewire_ws.rs"]
+pub mod ws;
 
-pub use daemon_store::{DaemonScheduler, ExpiryReport, LeasedTask, SchedulerTickReport};
+pub use daemon_store::{
+    DaemonScheduler, ExpiryReport, LeasedTask, SchedulerLoopReport, SchedulerTickReport,
+};
 pub use remote_store::{
     ensure_schema, AcceptOutcome, HandshakeAck, HiveWireStore, MessageState, PendingTask,
+    SCHEMA_V33, SCHEMA_V33_DOWN,
 };
+pub use ws::{HiveWireTransport, HANDSHAKE_TIMEOUT, HIVEWIRE_WS_PATH, IDLE_TIMEOUT};
 
 /// Protocol version written into (and checked on) every envelope.
 pub const PROTOCOL_VERSION: &str = "hivewire.v1";
 
 /// Hard ceiling for one encoded envelope. Larger frames are refused, never
-/// truncated.
+/// truncated. The WebSocket transport applies the same bound per message.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 /// Hard ceiling for one task payload. Enforced in addition to
 /// [`MAX_FRAME_BYTES`] so a small kind cannot smuggle a large body.
 pub const MAX_TASK_PAYLOAD_BYTES: usize = 32 * 1024;
 
+/// Hard ceiling for a result/error payload (the opaque `output`/detail body).
+pub const MAX_RESULT_PAYLOAD_BYTES: usize = 32 * 1024;
+
 /// Minimum launch-token length. Shorter tokens are a configuration refusal.
 pub const MIN_LAUNCH_TOKEN_LEN: usize = 16;
+
+/// Maximum launch-token length. A token is hashed on every handshake, so an
+/// unbounded bearer value would be needless work; the bound is part of the
+/// configuration contract.
+pub const MAX_LAUNCH_TOKEN_LEN: usize = 512;
 
 /// Default bounded-queue capacity (queued + leased tasks).
 pub const DEFAULT_QUEUE_CAPACITY: usize = 32;
@@ -81,7 +120,9 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Stable SHA-256 digest of a launch token. The plaintext token is never stored.
@@ -134,7 +175,9 @@ pub enum HiveWireError {
         remote_id: String,
     },
     /// The hello names a different remote than the configured one.
-    #[error("HiveWire hello names remote `{presented}` but the link is configured for `{expected}`")]
+    #[error(
+        "HiveWire hello names remote `{presented}` but the link is configured for `{expected}`"
+    )]
     RemoteMismatch {
         /// Configured remote.
         expected: String,
@@ -173,6 +216,32 @@ pub enum HiveWireError {
         /// Session id on the frame.
         session_id: String,
     },
+    /// The WebSocket `Origin` is missing or not allowlisted.
+    #[error("the HiveWire Origin `{origin:?}` is not allowlisted for this transport")]
+    OriginRejected {
+        /// Rejected Origin, or `None` when the header was absent.
+        origin: Option<String>,
+    },
+    /// No `hello` frame arrived before the handshake deadline.
+    #[error("the HiveWire handshake did not complete within {timeout_ms} ms")]
+    HandshakeTimeout {
+        /// Configured deadline in milliseconds.
+        timeout_ms: u64,
+    },
+    /// The peer sent nothing for longer than the idle deadline.
+    #[error("the HiveWire connection was idle for {timeout_ms} ms")]
+    IdleTimeout {
+        /// Configured idle deadline in milliseconds.
+        timeout_ms: u64,
+    },
+    /// One encoded frame exceeded the per-message ceiling.
+    #[error("HiveWire frame is {bytes} bytes (limit {limit})")]
+    FrameTooLarge {
+        /// Observed frame length.
+        bytes: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
     /// A completion was posted by a daemon that no longer holds the lease.
     #[error("HiveWire lease for message `{message_id}` is not held by daemon `{owner}`")]
     LeaseLost {
@@ -210,9 +279,40 @@ impl HiveWireError {
             Self::SequenceGap { .. } => "E_HIVEWIRE_SEQUENCE",
             Self::QueueFull { .. } => "E_HIVEWIRE_QUEUE_FULL",
             Self::SessionUnknown { .. } => "E_HIVEWIRE_SESSION_UNKNOWN",
+            Self::OriginRejected { .. } => "E_HIVEWIRE_ORIGIN_REJECTED",
+            Self::HandshakeTimeout { .. } => "E_HIVEWIRE_HANDSHAKE_TIMEOUT",
+            Self::IdleTimeout { .. } => "E_HIVEWIRE_IDLE_TIMEOUT",
+            Self::FrameTooLarge { .. } => "E_HIVEWIRE_FRAME_TOO_LARGE",
             Self::LeaseLost { .. } => "E_HIVEWIRE_LEASE_LOST",
             Self::ConfigInvalid { .. } => "E_HIVEWIRE_CONFIG",
             Self::Store { .. } => "E_HIVEWIRE_STORE",
+        }
+    }
+
+    /// Whether the same operation can succeed if retried after a delay.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::QueueFull { .. }
+                | Self::LeaseLost { .. }
+                | Self::HandshakeTimeout { .. }
+                | Self::IdleTimeout { .. }
+                | Self::Store { .. }
+        )
+    }
+
+    /// HTTP status used for a pre-upgrade refusal.
+    #[must_use]
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::TokenRejected { .. } => 401,
+            Self::OriginRejected { .. } => 403,
+            Self::RemoteNotConfigured { .. }
+            | Self::TokenConfig { .. }
+            | Self::ConfigInvalid { .. }
+            | Self::Store { .. } => 500,
+            _ => 400,
         }
     }
 
@@ -221,13 +321,13 @@ impl HiveWireError {
     pub fn how_to_fix(&self) -> &'static str {
         match self {
             Self::RemoteNotConfigured { .. } => {
-                "Configure an inproc:// endpoint and a launch token of at least 16 characters for the remote."
+                "Configure an inproc:// or loopback ws:// endpoint and a launch token of 16..=512 non-whitespace characters for the remote."
             }
             Self::UnsupportedTransport { .. } => {
-                "Use the local in-process endpoint (inproc://<hive>/<remote>); no network transport exists in this build."
+                "Use inproc://<hive>/<remote> or ws://127.0.0.1:<port>/api/hivewire/ws. TLS (wss://) and remote hosts are not implemented."
             }
             Self::TokenConfig { .. } => {
-                "Configure a launch token of at least 16 non-whitespace characters."
+                "Configure a launch token of 16..=512 non-whitespace characters."
             }
             Self::TokenRejected { .. } => {
                 "Present the launch token configured for this remote; refresh it from the remote's enrolment record."
@@ -242,19 +342,31 @@ impl HiveWireError {
                 "Fix the envelope fields; see the HiveWire v1 contract in this module."
             }
             Self::SequenceGap { .. } => {
-                "Handshake again and resume from server_last_sequence; do not skip or replay sequences."
+                "Resend the refused frame with the next expected sequence; a refused frame does not consume a sequence."
             }
             Self::QueueFull { .. } => {
-                "Wait for the daemon scheduler to drain the queue, then resend the task."
+                "Wait for the daemon scheduler to drain the queue, then resend the task with the next sequence."
             }
             Self::SessionUnknown { .. } => {
                 "Run the hello handshake again to obtain a fresh session id."
             }
+            Self::OriginRejected { .. } => {
+                "Send the Origin allowlisted for this transport, or configure a native (Origin-less) allowlist."
+            }
+            Self::HandshakeTimeout { .. } => {
+                "Send one hello envelope immediately after the upgrade; the handshake deadline is 5 seconds."
+            }
+            Self::IdleTimeout { .. } => {
+                "Send a heartbeat envelope at least every 30 seconds to keep the connection open."
+            }
+            Self::FrameTooLarge { .. } => {
+                "Split the work or reduce the payload; one frame may not exceed 64 KiB."
+            }
             Self::LeaseLost { .. } => {
-                "Let the lease expire and re-lease the task; do not complete work you no longer own."
+                "Do not complete work you no longer own; the task is requeued for a fresh lease after expiry."
             }
             Self::ConfigInvalid { .. } => {
-                "Use a positive lease, a positive attempt ceiling and a positive batch size."
+                "Use a positive interval, a positive lease, a positive attempt ceiling and a positive batch size."
             }
             Self::Store { .. } => {
                 "Inspect the local SQLite error; the message was refused rather than reported as delivered."
@@ -287,12 +399,49 @@ pub struct TaskPayload {
     pub payload: serde_json::Value,
 }
 
+/// The exact lease a completion settles.
+///
+/// A result/error is only evidence for the attempt that actually held the
+/// lease. Without this identity a slow worker could settle a task after its
+/// lease expired and another daemon had already re-leased it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseIdentity {
+    /// Message id of the queued `task` frame that was leased.
+    pub message_id: String,
+    /// Attempt counter written by the scheduler (1 on the first lease).
+    pub attempt: u32,
+    /// Daemon id that holds the lease (`lease_owner`).
+    pub daemon_id: String,
+}
+
+impl LeaseIdentity {
+    /// Validates the identity's field bounds.
+    ///
+    /// # Errors
+    /// [`HiveWireError::BadFrame`] when any field is empty or over its bound.
+    pub fn validate(&self) -> Result<(), HiveWireError> {
+        if self.message_id.trim().is_empty() || self.message_id.len() > 128 {
+            return Err(bad("lease.message_id must be 1..=128 characters"));
+        }
+        if self.attempt == 0 {
+            return Err(bad("lease.attempt must be >= 1"));
+        }
+        if self.daemon_id.trim().is_empty() || self.daemon_id.len() > 128 {
+            return Err(bad("lease.daemon_id must be 1..=128 characters"));
+        }
+        Ok(())
+    }
+}
+
 /// `result` payload: the outcome of one leased task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskResult {
     /// Task that produced this result.
     pub task_id: String,
+    /// Lease that this result settles.
+    pub lease: LeaseIdentity,
     /// Whether the task succeeded.
     pub ok: bool,
     /// Opaque JSON result body.
@@ -300,11 +449,18 @@ pub struct TaskResult {
 }
 
 /// `error` payload: a named remote failure.
+///
+/// A task-scoped error must carry the same [`LeaseIdentity`] a result would, so
+/// a stale worker cannot fail a task another daemon now owns. A remote-wide
+/// error (`task_id: None`) carries no lease and settles nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskError {
     /// Task that failed, when the failure is task-scoped.
     pub task_id: Option<String>,
+    /// Lease that this error settles (required when `task_id` is set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<LeaseIdentity>,
     /// Stable refusal code (`E_*`).
     pub code: String,
     /// Operator-readable cause.
@@ -512,7 +668,260 @@ impl WireEnvelope {
                 return Err(bad("heartbeat.remote_id must not be empty"));
             }
         }
+        if let MessageBody::Result(result) = &self.body {
+            if result.task_id.trim().is_empty() || result.task_id.len() > 128 {
+                return Err(bad("result.task_id must be 1..=128 characters"));
+            }
+            result.lease.validate()?;
+            let output_len = serde_json::to_vec(&result.output)
+                .map_err(|error| bad(format!("result output is not encodable: {error}")))?
+                .len();
+            if output_len > MAX_RESULT_PAYLOAD_BYTES {
+                return Err(bad(format!(
+                    "result output is {output_len} bytes (limit {MAX_RESULT_PAYLOAD_BYTES})"
+                )));
+            }
+        }
+        if let MessageBody::Error(error) = &self.body {
+            if error.code.trim().is_empty() || error.code.len() > 64 {
+                return Err(bad("error.code must be 1..=64 characters"));
+            }
+            if error.message.len() > 1024 {
+                return Err(bad("error.message must be <= 1024 characters"));
+            }
+            match (&error.task_id, &error.lease) {
+                (Some(task_id), Some(lease)) => {
+                    if task_id.trim().is_empty() || task_id.len() > 128 {
+                        return Err(bad("error.task_id must be 1..=128 characters"));
+                    }
+                    lease.validate()?;
+                }
+                (Some(_), None) => {
+                    return Err(bad(
+                        "an error for a task must carry the lease identity that it settles",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(bad(
+                        "a lease identity is meaningless on a remote-wide error (task_id is absent)",
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
         Ok((session_id, sequence))
+    }
+}
+
+/// One server-to-client frame. The server speaks the same versioned JSON
+/// envelope discipline as the client but has its own body set, so a client can
+/// never forge an acknowledgement by sending a client body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerEnvelope {
+    /// Protocol version; must equal [`PROTOCOL_VERSION`].
+    pub protocol: String,
+    /// Unique server message id.
+    pub message_id: String,
+    /// Server clock, milliseconds since the Unix epoch.
+    pub sent_at_ms: i64,
+    /// Session the reply belongs to, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Client message id this frame answers, when it answers one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Reply body.
+    pub body: ServerBody,
+}
+
+/// The three server reply bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum ServerBody {
+    /// Handshake accepted; carries the new session.
+    HelloAck(HelloAckFrame),
+    /// A client frame was accepted exactly once.
+    Ack(AckFrame),
+    /// A client frame was refused by name.
+    Error(ErrorFrame),
+}
+
+impl ServerBody {
+    /// Stable kind string (`hello_ack` / `ack` / `error`).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::HelloAck(_) => "hello_ack",
+            Self::Ack(_) => "ack",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
+/// `hello_ack` payload: the session the client must use from now on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloAckFrame {
+    /// Protocol version confirmed by the server.
+    pub protocol: String,
+    /// New session id.
+    pub session_id: String,
+    /// Highest sequence the server has stored for this remote.
+    pub server_last_sequence: u64,
+    /// Sequence the next client frame must carry.
+    pub next_sequence: u64,
+    /// True when the client must replay from the server's history.
+    pub replay_required: bool,
+}
+
+/// What the server did with one accepted client frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AckKind {
+    /// A new task was persisted in the bounded queue.
+    Queued,
+    /// A result/error/heartbeat was persisted.
+    Recorded,
+    /// The `(remote_id, message_id)` pair was already stored; nothing changed.
+    Duplicate,
+}
+
+/// `ack` payload: the frame was accepted exactly once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AckFrame {
+    /// Client body kind (`task` / `result` / `error` / `heartbeat`).
+    pub kind: String,
+    /// Sequence the accepted frame carried.
+    pub sequence: u64,
+    /// What the store did with it.
+    pub outcome: AckKind,
+}
+
+/// `error` payload: a named server refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorFrame {
+    /// Stable refusal code (`E_*`).
+    pub code: String,
+    /// Operator-readable cause.
+    pub message: String,
+    /// What the operator can do about it.
+    pub how_to_fix: String,
+    /// Whether the same operation may succeed if retried.
+    pub retryable: bool,
+    /// Task named by the refused frame, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
+impl ServerEnvelope {
+    fn build(
+        session_id: Option<String>,
+        reply_to: Option<String>,
+        body: ServerBody,
+    ) -> Result<Self, HiveWireError> {
+        let envelope = Self {
+            protocol: PROTOCOL_VERSION.to_owned(),
+            message_id: uuid::Uuid::now_v7().to_string(),
+            sent_at_ms: now_ms(),
+            session_id,
+            reply_to,
+            body,
+        };
+        let encoded = serde_json::to_vec(&envelope)
+            .map_err(|error| bad(format!("server envelope is not encodable: {error}")))?;
+        if encoded.len() > MAX_FRAME_BYTES {
+            return Err(HiveWireError::FrameTooLarge {
+                bytes: encoded.len(),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        Ok(envelope)
+    }
+
+    /// Builds the `hello_ack` reply for a successful handshake.
+    ///
+    /// # Errors
+    /// [`HiveWireError::BadFrame`] when the reply cannot be encoded.
+    pub fn hello_ack(
+        ack: &remote_store::HandshakeAck,
+        reply_to: &str,
+    ) -> Result<Self, HiveWireError> {
+        Self::build(
+            Some(ack.session_id.clone()),
+            Some(reply_to.to_owned()),
+            ServerBody::HelloAck(HelloAckFrame {
+                protocol: ack.protocol.clone(),
+                session_id: ack.session_id.clone(),
+                server_last_sequence: ack.server_last_sequence,
+                next_sequence: ack.next_sequence,
+                replay_required: ack.replay_required,
+            }),
+        )
+    }
+
+    /// Builds an acceptance reply.
+    ///
+    /// # Errors
+    /// [`HiveWireError::BadFrame`] when the reply cannot be encoded.
+    pub fn ack(
+        session_id: &str,
+        reply_to: &str,
+        kind: &str,
+        sequence: u64,
+        outcome: AckKind,
+    ) -> Result<Self, HiveWireError> {
+        Self::build(
+            Some(session_id.to_owned()),
+            Some(reply_to.to_owned()),
+            ServerBody::Ack(AckFrame {
+                kind: kind.to_owned(),
+                sequence,
+                outcome,
+            }),
+        )
+    }
+
+    /// Builds a named refusal reply.
+    ///
+    /// # Errors
+    /// [`HiveWireError::BadFrame`] when the reply cannot be encoded.
+    pub fn error(
+        session_id: Option<&str>,
+        reply_to: Option<&str>,
+        task_id: Option<&str>,
+        error: &HiveWireError,
+    ) -> Result<Self, HiveWireError> {
+        Self::build(
+            session_id.map(str::to_owned),
+            reply_to.map(str::to_owned),
+            ServerBody::Error(ErrorFrame {
+                code: error.code().to_owned(),
+                message: error.to_string(),
+                how_to_fix: error.how_to_fix().to_owned(),
+                retryable: error.retryable(),
+                task_id: task_id.map(str::to_owned),
+            }),
+        )
+    }
+
+    /// Encoded JSON text for one WebSocket message.
+    ///
+    /// # Errors
+    /// [`HiveWireError::BadFrame`] when the envelope cannot be encoded.
+    pub fn encode(&self) -> Result<String, HiveWireError> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| bad(format!("server envelope is not encodable: {error}")))?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(HiveWireError::FrameTooLarge {
+                bytes: bytes.len(),
+                limit: MAX_FRAME_BYTES,
+            });
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| bad(format!("server envelope is not UTF-8: {error}")))
     }
 }
 
@@ -522,7 +931,9 @@ impl WireEnvelope {
 pub struct HiveWireConfig {
     /// Remote name used in the handshake and on every queued task.
     pub remote_id: String,
-    /// Endpoint. Only `inproc://<hive>/<remote>` is accepted in this build.
+    /// Endpoint: `inproc://<hive>/<remote>` or a loopback
+    /// `ws://127.0.0.1:<port>/api/hivewire/ws`. `wss://`/remote hosts are
+    /// refused because this build implements no TLS.
     pub endpoint: Option<String>,
     /// Launch token plaintext. It is hashed before it reaches the database.
     pub launch_token: Option<String>,
@@ -544,6 +955,20 @@ impl HiveWireConfig {
             launch_token: Some(launch_token.into()),
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
         }
+    }
+
+    /// A remote reached over the loopback WebSocket transport.
+    #[must_use]
+    pub fn loopback_ws(
+        remote_id: impl Into<String>,
+        port: u16,
+        launch_token: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            remote_id,
+            format!("ws://127.0.0.1:{port}{}", ws::HIVEWIRE_WS_PATH),
+            launch_token,
+        )
     }
 
     /// A remote with no endpoint and no token: every operation must refuse.
@@ -578,8 +1003,8 @@ impl HiveWireConfig {
     ///
     /// # Errors
     /// [`HiveWireError::RemoteNotConfigured`] when endpoint/token are absent,
-    /// [`HiveWireError::UnsupportedTransport`] for a non-local scheme, and
-    /// [`HiveWireError::TokenConfig`] for a weak token.
+    /// [`HiveWireError::UnsupportedTransport`] for a non-loopback or TLS
+    /// scheme, and [`HiveWireError::TokenConfig`] for a weak/oversized token.
     pub fn validate(&self) -> Result<(), HiveWireError> {
         self.validate_remote_id()?;
         if self.queue_capacity == 0 {
@@ -587,35 +1012,64 @@ impl HiveWireConfig {
                 detail: "queue_capacity must be positive".to_owned(),
             });
         }
-        let endpoint = self
-            .endpoint
-            .as_deref()
-            .ok_or_else(|| HiveWireError::RemoteNotConfigured {
-                remote_id: self.remote_id.clone(),
-            })?;
-        let Some(rest) = endpoint.strip_prefix("inproc://") else {
-            return Err(HiveWireError::UnsupportedTransport {
-                endpoint: endpoint.to_owned(),
-            });
-        };
-        if rest.trim_matches('/').is_empty() {
+        let endpoint =
+            self.endpoint
+                .as_deref()
+                .ok_or_else(|| HiveWireError::RemoteNotConfigured {
+                    remote_id: self.remote_id.clone(),
+                })?;
+        if !endpoint_is_supported(endpoint) {
             return Err(HiveWireError::UnsupportedTransport {
                 endpoint: endpoint.to_owned(),
             });
         }
-        let token = self
-            .launch_token
-            .as_deref()
-            .ok_or_else(|| HiveWireError::RemoteNotConfigured {
-                remote_id: self.remote_id.clone(),
-            })?;
-        if token.chars().count() < MIN_LAUNCH_TOKEN_LEN || token.chars().any(char::is_whitespace) {
+        let token =
+            self.launch_token
+                .as_deref()
+                .ok_or_else(|| HiveWireError::RemoteNotConfigured {
+                    remote_id: self.remote_id.clone(),
+                })?;
+        let token_chars = token.chars().count();
+        if token_chars < MIN_LAUNCH_TOKEN_LEN
+            || token_chars > MAX_LAUNCH_TOKEN_LEN
+            || token.chars().any(char::is_whitespace)
+        {
             return Err(HiveWireError::TokenConfig {
-                detail: format!("the launch token must be at least {MIN_LAUNCH_TOKEN_LEN} non-whitespace characters"),
+                detail: format!(
+                    "the launch token must be {MIN_LAUNCH_TOKEN_LEN}..={MAX_LAUNCH_TOKEN_LEN} non-whitespace characters"
+                ),
             });
         }
         Ok(())
     }
+}
+
+/// Whether an endpoint names a transport this build actually implements:
+/// an in-process tunnel or a loopback plaintext WebSocket. TLS (`wss://`) and
+/// non-loopback hosts are refused; there is no listener here that could honour
+/// them.
+#[must_use]
+pub fn endpoint_is_supported(endpoint: &str) -> bool {
+    if let Some(rest) = endpoint.strip_prefix("inproc://") {
+        return !rest.trim_matches('/').is_empty();
+    }
+    let Some(rest) = endpoint.strip_prefix("ws://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return false;
+    }
+    let host = if let Some(without_open) = authority.strip_prefix('[') {
+        without_open.split(']').next().unwrap_or_default()
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _port)| host)
+    };
+    host.eq_ignore_ascii_case("127.0.0.1")
+        || host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("::1")
 }
 
 /// Maps a SQLite error to the store failure.

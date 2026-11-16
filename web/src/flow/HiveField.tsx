@@ -65,21 +65,13 @@ const HIVE_BOX_HEIGHT = 660;
 /** Lobe centre lines inside the 620x660 box; every lobe is rx 270 / ry 108. */
 const LOBE_CY = [95, 215, 335, 455, 575] as const;
 
-/** Sheen box mirrors the hive box so the highlight lands on the beehive. */
-const SHEEN_BOX = 'pointer-events-none absolute h-[660px] w-[620px]';
-const SHEEN_BOX_CENTRED = `${SHEEN_BOX} left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2`;
-const SHEEN_BOX_ANCHORED = `${SHEEN_BOX} left-0 top-0`;
+/** Sheen box fills the same box as the fitted hive. */
+const SHEEN_BOX = 'pointer-events-none absolute inset-0';
 
-export function HiveField({ center = true }: { center?: boolean }) {
+export function HiveField() {
   const reduced = useAppReducedMotion();
   const [rippleSeconds, setRippleSeconds] = useState(randomRippleSeconds);
   const [rippleCycle, setRippleCycle] = useState(0);
-  // The hive is placed as a 620x660 viewport at 50%/50% of the field and
-  // pulled back by half its box, so no measurement or JS is involved.
-  const hiveOrigin = center ? '50%' : 0;
-  const hiveTransform = center
-    ? `translate(-${HIVE_BOX_WIDTH / 2} -${HIVE_BOX_HEIGHT / 2})`
-    : undefined;
 
   return (
     <div aria-hidden="true" className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
@@ -261,14 +253,23 @@ export function HiveField({ center = true }: { center?: boolean }) {
             }}
           />
         )}
-        <use
-          href="#hivefield-hive"
-          x={hiveOrigin}
-          y={hiveOrigin}
-          width={HIVE_BOX_WIDTH}
-          height={HIVE_BOX_HEIGHT}
-          transform={hiveTransform}
-        />
+        <svg
+          x="0"
+          y="0"
+          width="100%"
+          height="100%"
+          viewBox={`0 0 ${HIVE_BOX_WIDTH} ${HIVE_BOX_HEIGHT}`}
+          preserveAspectRatio="xMidYMid meet"
+          overflow="visible"
+        >
+          <use
+            href="#hivefield-hive"
+            x="0"
+            y="0"
+            width={HIVE_BOX_WIDTH}
+            height={HIVE_BOX_HEIGHT}
+          />
+        </svg>
         {reduced ? null : (
           <g className="ambient-bee-swarm" aria-hidden="true">
             <AmbientBee scale={0.7} duration="19s" begin="-2s" opacity={0.8} />
@@ -277,7 +278,7 @@ export function HiveField({ center = true }: { center?: boolean }) {
           </g>
         )}
       </svg>
-      <div className={center ? SHEEN_BOX_CENTRED : SHEEN_BOX_ANCHORED}>
+      <div className={SHEEN_BOX}>
         <div className="motion-hive-sheen absolute inset-0" />
       </div>
     </div>

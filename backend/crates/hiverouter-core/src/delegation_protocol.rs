@@ -7,58 +7,84 @@
 //!   and sibling-only dependencies ([`decompose`]);
 //! - the tree is validated against the same depth / fan-out / agent caps the
 //!   engine enforces ([`DelegationTree::validate`], [`DelegationLimits::from_caps`]);
+//! - a planned [`PlanNodeSeat`] maps `PlanNode::objective` directly to
+//!   `Seat::brief` ([`Seat::from_plan_seat`],
+//!   [`seat_brief_from_plan_objective`]); there is no whole-run-prompt fallback;
 //! - results are received **bottom-up** ([`ReportLedger::submit`]): a child must
 //!   report before its parent, a seat cannot be reported twice, a result must
 //!   name a known seat, and a parent may not claim `Completed` over a child that
 //!   did not complete;
+//! - a per-run ledger is rebuilt from persisted `TaskRecord` rows plus a
+//!   [`TaskResultSource`] port ([`ReportLedger::from_task_records`],
+//!   [`ReportLedger::rebuild_from_task_rows`]); a `Completed` row with no
+//!   recorded result is refused, never given a fabricated success body;
 //! - the completed tree is **synthesized** into a deterministic summary plus a
-//!   root per-tree SHA-256 digest over the structure and every result
-//!   ([`TreeSynthesis::root_digest`]).
+//!   root SHA-256 digest over the structure and every result
+//!   ([`TreeSynthesis::root_digest`]) **and** one digest per seat subtree
+//!   ([`TreeSynthesis::subtree_digests`]), so a manager can publish its branch
+//!   digest without a sibling branch.
 //!
-//! Failure/blocked seats are never counted as success: [`SeatCounts`] counts each
-//! status separately and [`TreeSynthesis::succeeded`] is true only when every
-//! seat in the tree (root included) is `Completed`.
+//! Failure/blocked/killed seats are never counted as success: [`SeatCounts`]
+//! counts each status separately and [`TreeSynthesis::succeeded`] is true only
+//! when every seat in the tree (root included) is `Completed`.
 //!
 //! # Wiring (this change edits no other file)
 //!
-//! **`lib.rs`** — add `pub mod delegation_protocol;` next to `pub mod planner;`
-//! (and, when convenient, re-export `DelegationTree`, `DelegationLimits`,
-//! `SeatTier`, `ReportLedger`, `SeatReport`, `TreeSynthesis`).
+//! **`lib.rs`** — `pub mod delegation_protocol;` already exists (line 13).
+//! Optional re-export for callers:
+//! `pub use delegation_protocol::{DelegationBuilder, DelegationLimits,
+//! DelegationTree, ReportLedger, SeatReport, SeatStatus, SeatTier, TaskRow,
+//! TaskResultSource, TreeSynthesis};`.
 //!
-//! **`planner.rs`** — `seat.seat_id` is the `TaskId` that becomes
-//! `PlanNode::node_id`; `seat.tier.planner_role()` is the canonical role string
-//! the planner already accepts (`hyper`, `superagent`, `agent`, `subagent`); and
-//! `seat.depth` is the plan depth. The CEO is the run root at depth 0 and is
-//! never a plan node, so a manager seat at depth 1 becomes a depth-1
-//! `superagent` node. Call `DelegationTree::validate(&registry, &limits)` before
-//! the root row is persisted so an invalid delegation shape is refused at plan
-//! time, exactly as `Plan::validate` refuses fan-out before dispatch.
+//! **`planner.rs`/planning path** — `PlanNode::node_id` becomes `seat_id`,
+//! `PlanNode::parent` becomes the delegation edge, `PlanNode::depth` is the
+//! seat depth, and **`PlanNode::objective` is the seat brief** through
+//! [`Seat::from_plan_node`] / [`Seat::from_plan_seat`]. The CEO is the run root
+//! at depth 0 and is never a plan node; a depth-1 `superagent` node is the
+//! manager seat. A node with no objective is refused (`E_SCHEMA_INVALID`) — do
+//! not fall back to the run prompt. Validate the resulting tree with
+//! [`DelegationTree::validate`] before the root row is persisted, exactly as
+//! `Plan::validate` refuses fan-out before dispatch.
 //!
 //! **`execution.rs`** — seats are task rows (`seat_id` is a real `TaskId`).
-//! Build the ledger once with `ReportLedger::new(tree, &registry, &limits)` and
-//! submit a report when each task settles: `AgentState::Completed` maps to
-//! `SeatReport::completed`, while `Failed`/`Cancelled`/`Killed`/`Interrupted`
-//! map to `SeatReport::failed`/`cancelled`/`blocked` (never to `completed`) with
-//! the recorded `Refusal` when one exists. `submit` refuses a parent report that
-//! arrives before its children and a parent that claims `Completed` over a
-//! non-completed child. The run root's final turn should consume
-//! `TreeSynthesis::summary`, and `Store::write_run_digest` should record
-//! `TreeSynthesis::root_digest`: it is computed over the whole tree plus every
-//! result, so an unchanged tree and results always produce the same digest and
-//! any changed status or body changes it.
+//! Two paths:
+//!
+//! * live: build `ReportLedger::new(tree, &tool_registry, &limits)` once per run
+//!   and submit when a task settles. Map the durable state with
+//!   [`SeatStatus::from_agent_state`] (`Completed` -> `Completed`; `Failed` ->
+//!   `Failed`; `Cancelled` -> `Cancelled`; `Killed` -> `Killed`; `Interrupted`
+//!   -> `Cancelled`; a non-terminal state -> `None`, so it is never reported as
+//!   success). `Blocked` is a report status the engine chooses explicitly and
+//!   it is never treated as `Completed`. Attach the recorded `Refusal`.
+//! * restore/recovery: `RunStore::tasks_for_run(run_id)` plus the store itself
+//!   as the [`TaskResultSource`] (implemented in this module for
+//!   `RunStore::task_result`), then
+//!   `ReportLedger::from_task_records(tree, &tool_registry, &limits, &rows,
+//!   &engine.store)?`. This refuses a `Completed` row with no recorded result
+//!   instead of inventing one.
+//!
+//! `submit` refuses a parent report that arrives before its children and a
+//! parent that claims `Completed` over a non-completed child. The run root's
+//! final turn should consume `TreeSynthesis::summary`, and
+//! `Store::write_run_digest` should record `TreeSynthesis::root_digest`. A
+//! manager/lead may record `TreeSynthesis::subtree_digest(seat_id)` for its own
+//! branch; the root digest still covers the whole tree. The digest is computed
+//! over structure, briefs, tools, statuses, refusals and every result body, so
+//! an unchanged tree and results always produce the same digest and any changed
+//! status or body changes it.
 //!
 //! **`assets/prompts/superagent.prompty`** — the manager prompt should require
-//! child seats with a plain-English brief of 1..=[`MAX_BRIEF_CHARS`] characters
-//! and at least [`MIN_BRIEF_WORDS`] words, an owner tier from the strict ladder,
-//! tools from that tier's registry allowlist, and sibling-only dependencies.
-//! `SeatTier::planner_role` is the bridge between the delegation vocabulary and
-//! the role ladder the planner prompt already carries.
+//! child seats with a plain-English brief of at least [`MIN_BRIEF_WORDS`] words
+//! and at most [`MAX_BRIEF_CHARS`] characters, an owner tier from the strict
+//! ladder, tools from that tier's registry allowlist, and sibling-only
+//! dependencies. `SeatTier::planner_role` is the bridge between the delegation
+//! vocabulary and the role ladder the planner prompt already carries.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
-use hiverouter_contract::{Refusal, TaskId};
+use hiverouter_contract::{AgentState, Refusal, RunId, TaskId};
 use hiverouter_tools::{sha256_hex, AgentTier, ToolId, ToolRegistry};
 use serde::{Deserialize, Serialize};
 
@@ -70,7 +96,11 @@ pub const MAX_DELEGATION_FANOUT: usize = 8;
 /// Maximum seats in one delegation tree, root included. Mirrors `caps::MAX_AGENTS`.
 pub const MAX_DELEGATION_SEATS: usize = 64;
 /// Maximum characters in one plain-English seat brief.
-pub const MAX_BRIEF_CHARS: usize = 600;
+///
+/// This matches the planner's `objective` ceiling (8..=800 in
+/// `execution.rs`), so every objective the planner is allowed to emit fits a
+/// seat brief without truncation. A longer objective is refused, never clipped.
+pub const MAX_BRIEF_CHARS: usize = 800;
 /// Minimum plain-English words in one seat brief.
 pub const MIN_BRIEF_WORDS: usize = 2;
 /// Maximum characters in one accepted seat result.
@@ -188,9 +218,17 @@ impl SeatTier {
             .replace(['-', ' '], "_")
             .as_str()
         {
-            "ceo" | "chief" | "chief_executive" | "chief_executive_officer" => Some(SeatTier::Ceo),
+            "ceo"
+            | "chief"
+            | "chief_executive"
+            | "chief_executive_officer"
+            | "hyper"
+            | "hyperagent"
+            | "hyper_agent"
+            | "planner" => Some(SeatTier::Ceo),
             "manager" | "super" | "superagent" | "super_agent" => Some(SeatTier::Manager),
-            "team_lead" | "teamlead" | "lead" | "agent" | "worker" | "worker_agent" => {
+            "team_lead" | "teamlead" | "lead" | "agent" | "worker" | "worker_agent"
+            | "content_writer" | "data_analyst" | "code_reviewer" | "chatbot" => {
                 Some(SeatTier::TeamLead)
             }
             "assistant" | "subagent" | "sub_agent" => Some(SeatTier::Assistant),
@@ -427,19 +465,17 @@ impl DelegationLimits {
 ///
 /// # Errors
 /// `E_SCHEMA_INVALID` with the exact failing rule in [`DelegationError::detail`].
-pub fn validate_brief(
-    brief: &str,
-    limits: &DelegationLimits,
-) -> Result<(), DelegationError> {
+pub fn validate_brief(brief: &str, limits: &DelegationLimits) -> Result<(), DelegationError> {
     let trimmed = brief.trim();
     if trimmed.is_empty() {
         return Err(invalid(
             "brief is empty: every delegated seat needs a plain-English instruction",
         ));
     }
-    if trimmed.chars().any(|character| {
-        character.is_control() && character != '\n' && character != '\t'
-    }) {
+    if trimmed
+        .chars()
+        .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
         return Err(invalid(
             "brief contains a control character; send plain text only",
         ));
@@ -503,6 +539,208 @@ pub fn validate_tools(
         }
     }
     Ok(())
+}
+
+/// The fields of one `planner::PlanNode` that become a seat.
+///
+/// `PlannerNode` itself is outside this module's ownership, so this view keeps
+/// the mapping explicit and testable: the planner's `objective` is the seat's
+/// brief, `role` selects the rung, `depth` and `parent` are checked against the
+/// manager, and `deps` become sibling-only dependencies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanNodeSeat<'a> {
+    /// Planned task id (becomes the seat id / persisted task id).
+    pub node_id: TaskId,
+    /// Planned parent (`None` only for a depth-1 node attached to the CEO).
+    pub parent: Option<TaskId>,
+    /// Planner role/persona.
+    pub role: &'a str,
+    /// Planned depth (1..=3).
+    pub depth: u8,
+    /// The planner's plain-English objective. This is the brief; there is no
+    /// whole-run-prompt fallback for a delegated seat.
+    pub objective: Option<&'a str>,
+    /// Sibling seats whose results must land first.
+    pub deps: &'a [TaskId],
+}
+
+impl<'a> PlanNodeSeat<'a> {
+    /// Builds the view from already-extracted plan-node fields.
+    #[must_use]
+    pub fn new(
+        node_id: TaskId,
+        parent: Option<TaskId>,
+        role: &'a str,
+        depth: u8,
+        objective: Option<&'a str>,
+        deps: &'a [TaskId],
+    ) -> Self {
+        Self {
+            node_id,
+            parent,
+            role,
+            depth,
+            objective,
+            deps,
+        }
+    }
+}
+
+/// Maps a plan node's `objective` to a seat brief.
+///
+/// This is the single bridge between `PlanNode::objective` and [`Seat::brief`].
+/// There is deliberately no fallback to the whole run prompt: a missing or
+/// invalid objective is refused, because a delegated seat without its own brief
+/// is exactly the duplicate-work failure the delegation protocol exists to
+/// prevent. The returned brief is trimmed but never truncated.
+///
+/// # Errors
+/// `E_SCHEMA_INVALID` when the objective is absent, empty, has too few words,
+/// contains a control character, or exceeds [`DelegationLimits::max_brief_chars`].
+pub fn seat_brief_from_plan_objective(
+    node_id: TaskId,
+    objective: Option<&str>,
+    limits: &DelegationLimits,
+) -> Result<String, DelegationError> {
+    let Some(objective) = objective else {
+        return Err(invalid(format!(
+            "planned node {node_id} has no objective; a seat brief cannot fall back to the whole run prompt"
+        )));
+    };
+    validate_brief(objective, limits)?;
+    Ok(objective.trim().to_owned())
+}
+
+impl Seat {
+    /// Builds one child seat from a planned node's fields.
+    ///
+    /// The child tier is derived from the manager's rung and the planner role
+    /// must agree with it, so a plan node cannot skip a level or self-select
+    /// authority. The objective becomes the brief via
+    /// [`seat_brief_from_plan_objective`]; the tools are checked against the
+    /// child tier's real registry allowlist.
+    ///
+    /// # Errors
+    /// `E_SCHEMA_INVALID` for an unknown role, a depth/parent mismatch, or a
+    /// missing/invalid objective; `E_TOOL_NOT_ALLOWED` when the role is not the
+    /// manager's direct child or a tool is outside the child allowlist;
+    /// `E_TOOL_NOT_FOUND` for an unregistered tool.
+    pub fn from_plan_seat(
+        parent: &Seat,
+        planned: PlanNodeSeat<'_>,
+        tools: Vec<ToolId>,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+    ) -> Result<Self, DelegationError> {
+        let tier = SeatTier::from_label(planned.role).ok_or_else(|| {
+            invalid(format!(
+                "planned node {} has unknown role `{}`",
+                planned.node_id, planned.role
+            ))
+        })?;
+        let expected_tier = parent.tier.direct_child().ok_or_else(|| {
+            DelegationError::new(
+                Refusal::ToolNotAllowed,
+                format!(
+                    "{} seat {} may not delegate: the ladder ends at assistant",
+                    parent.tier.label(),
+                    parent.seat_id
+                ),
+            )
+        })?;
+        if tier != expected_tier {
+            return Err(DelegationError::new(
+                Refusal::ToolNotAllowed,
+                format!(
+                    "planned node {} role `{}` is a {} seat; manager {} may only own a {} seat",
+                    planned.node_id,
+                    planned.role,
+                    tier.label(),
+                    parent.seat_id,
+                    expected_tier.label()
+                ),
+            ));
+        }
+        let expected_depth = parent.depth.checked_add(1).ok_or_else(|| {
+            DelegationError::new(
+                Refusal::SpawnDepth,
+                format!("manager {} depth would overflow", parent.seat_id),
+            )
+        })?;
+        if planned.depth != expected_depth {
+            return Err(invalid(format!(
+                "planned node {} is at depth {}; under manager {} it must be depth {}",
+                planned.node_id, planned.depth, parent.seat_id, expected_depth
+            )));
+        }
+        match planned.parent {
+            Some(parent_id) if parent_id == parent.seat_id => {}
+            None if parent.tier == SeatTier::Ceo && planned.depth == 1 => {}
+            other => {
+                return Err(invalid(format!(
+                    "planned node {} names parent {:?}; the owning manager is {}",
+                    planned.node_id, other, parent.seat_id
+                )));
+            }
+        }
+        if planned.node_id == parent.seat_id {
+            return Err(invalid(format!(
+                "planned node {} collides with its manager",
+                planned.node_id
+            )));
+        }
+        let brief = seat_brief_from_plan_objective(planned.node_id, planned.objective, limits)?;
+        validate_tools(registry, tier, &tools)?;
+        Ok(Self {
+            seat_id: planned.node_id,
+            parent_seat_id: Some(parent.seat_id),
+            tier,
+            depth: expected_depth,
+            brief,
+            tools,
+            depends_on: planned.deps.to_vec(),
+        })
+    }
+}
+
+/// Direct `planner::PlanNode` adapter.
+///
+/// Gated off only while the legacy `#[path]` contract tests compile this file
+/// as a standalone module (they have no `crate::planner`); the library build
+/// and every integration test that uses `hiverouter_core::delegation_protocol`
+/// sees it.
+#[cfg(not(test))]
+impl Seat {
+    /// Builds a child seat directly from one `planner::PlanNode`.
+    ///
+    /// `node.objective` is the brief. Pass the tools the manager granted the
+    /// child; the plan itself carries no tool list, so this adapter never
+    /// widens authority by default.
+    ///
+    /// # Errors
+    /// Every refusal from [`Seat::from_plan_seat`].
+    pub fn from_plan_node(
+        parent: &Seat,
+        node: &crate::planner::PlanNode,
+        tools: Vec<ToolId>,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+    ) -> Result<Self, DelegationError> {
+        Self::from_plan_seat(
+            parent,
+            PlanNodeSeat::new(
+                node.node_id,
+                node.parent,
+                &node.role,
+                node.depth,
+                node.objective.as_deref(),
+                &node.deps,
+            ),
+            tools,
+            registry,
+            limits,
+        )
+    }
 }
 
 /// Decomposes a manager's brief into validated, bounded child seats.
@@ -620,11 +858,16 @@ pub fn decompose(
         }
         dependency_map.insert(spec.seat_id, spec.depends_on.clone());
     }
-    if has_dependency_cycle(&specs.iter().map(|spec| spec.seat_id).collect::<Vec<_>>(), &dependency_map)
-    {
+    if has_dependency_cycle(
+        &specs.iter().map(|spec| spec.seat_id).collect::<Vec<_>>(),
+        &dependency_map,
+    ) {
         return Err(DelegationError::new(
             Refusal::Cycle,
-            format!("manager {} children form a dependency cycle", manager.seat_id),
+            format!(
+                "manager {} children form a dependency cycle",
+                manager.seat_id
+            ),
         ));
     }
     let mut children = Vec::with_capacity(specs.len());
@@ -648,7 +891,7 @@ pub fn decompose(
 }
 
 /// One validated delegation tree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationTree {
     seats: Vec<Seat>,
 }
@@ -927,9 +1170,172 @@ impl DelegationTree {
     }
 }
 
-impl Default for DelegationTree {
-    fn default() -> Self {
-        Self { seats: Vec::new() }
+/// Direct `planner::Plan` adapter (gated only for the legacy `#[path]` tests;
+/// see [`Seat::from_plan_node`]).
+#[cfg(not(test))]
+impl DelegationTree {
+    /// Builds and validates a delegation tree from a validated planner plan.
+    ///
+    /// The CEO root is supplied by the engine (it owns the run root task id and
+    /// the run-level brief). Every plan node becomes a child seat whose brief is
+    /// exactly `node.objective`; the plan's `parent` edge is the delegation
+    /// edge and `deps` become sibling dependencies. The plan carries no tool
+    /// grants, so every seat starts with no tools; pass grants through
+    /// [`Seat::from_plan_node`] when a manager has approved specific tools.
+    ///
+    /// # Errors
+    /// `E_SCHEMA_INVALID` when the plan is empty, the root is not the CEO, a
+    /// node has no objective, or a parent/depth edge does not match the seat
+    /// ladder; plus every refusal from [`DelegationTree::validate`].
+    pub fn from_plan(
+        root: Seat,
+        plan: &crate::planner::Plan,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+    ) -> Result<Self, DelegationError> {
+        if root.tier != SeatTier::Ceo || root.depth != 0 || !root.is_root() {
+            return Err(invalid(format!(
+                "delegation root {} must be the parentless CEO at depth 0",
+                root.seat_id
+            )));
+        }
+        validate_brief(&root.brief, limits)?;
+        if plan.nodes.is_empty() {
+            return Err(invalid(
+                "a delegation tree needs at least one planned seat under the CEO",
+            ));
+        }
+        let mut seats = vec![root.clone()];
+        let mut ordered: Vec<&crate::planner::PlanNode> = plan.nodes.iter().collect();
+        ordered.sort_by_key(|node| (node.depth, node.node_id));
+        for node in ordered {
+            let parent = match node.parent {
+                Some(parent_id) => seats
+                    .iter()
+                    .find(|seat| seat.seat_id == parent_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DelegationError::new(
+                            Refusal::TaskNotFound,
+                            format!(
+                                "planned node {} names parent {} which is not an earlier seat",
+                                node.node_id, parent_id
+                            ),
+                        )
+                    })?,
+                None => root.clone(),
+            };
+            let seat = Seat::from_plan_node(&parent, node, Vec::new(), registry, limits)?;
+            if seats
+                .iter()
+                .any(|existing| existing.seat_id == seat.seat_id)
+            {
+                return Err(invalid(format!(
+                    "duplicate planned seat id {}",
+                    seat.seat_id
+                )));
+            }
+            seats.push(seat);
+        }
+        let tree = Self::new(seats);
+        tree.validate(registry, limits)?;
+        Ok(tree)
+    }
+}
+
+/// Enforces "one manager, one decomposition" while a tree is assembled.
+///
+/// A manager that has already delegated may not delegate again. Without this
+/// guard two calls to [`decompose`] can each return a valid child set, and the
+/// merged tree still passes [`DelegationTree::validate`] even though one
+/// manager effectively created two teams. The builder records every manager it
+/// has decomposed and refuses a second call before any child exists.
+#[derive(Clone, Debug)]
+pub struct DelegationBuilder {
+    tree: DelegationTree,
+    decomposed: HashSet<TaskId>,
+}
+
+impl DelegationBuilder {
+    /// Starts a tree at the CEO root.
+    ///
+    /// # Errors
+    /// `E_SCHEMA_INVALID` when `root` is not the parentless CEO at depth 0.
+    pub fn new(root: Seat) -> Result<Self, DelegationError> {
+        if root.tier != SeatTier::Ceo || root.depth != 0 || !root.is_root() {
+            return Err(invalid(format!(
+                "delegation builder root {} must be the parentless CEO at depth 0",
+                root.seat_id
+            )));
+        }
+        Ok(Self {
+            tree: DelegationTree::new(vec![root]),
+            decomposed: HashSet::new(),
+        })
+    }
+
+    /// Current tree (not yet validated as a whole).
+    #[must_use]
+    pub fn tree(&self) -> &DelegationTree {
+        &self.tree
+    }
+
+    /// Managers that have already used their one decomposition.
+    #[must_use]
+    pub fn decomposed_managers(&self) -> Vec<TaskId> {
+        let mut managers: Vec<TaskId> = self.decomposed.iter().copied().collect();
+        managers.sort();
+        managers
+    }
+
+    /// Decomposes one manager exactly once and appends the children.
+    ///
+    /// # Errors
+    /// `E_TASK_NOT_FOUND` for an unknown manager; `E_SCHEMA_INVALID` when the
+    /// manager already delegated (or already owns children supplied by the
+    /// plan); plus every refusal from [`decompose`].
+    pub fn decompose(
+        &mut self,
+        manager_id: TaskId,
+        specs: &[SeatSpec],
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+    ) -> Result<Decomposition, DelegationError> {
+        let manager = self.tree.seat(manager_id).cloned().ok_or_else(|| {
+            DelegationError::new(
+                Refusal::TaskNotFound,
+                format!("delegation manager {manager_id} is not in this tree"),
+            )
+        })?;
+        if self.decomposed.contains(&manager_id) {
+            return Err(invalid(format!(
+                "manager {manager_id} has already delegated; one decomposition per manager"
+            )));
+        }
+        if !self.tree.children_of(manager_id).is_empty() {
+            return Err(invalid(format!(
+                "manager {manager_id} already owns children; one decomposition per manager"
+            )));
+        }
+        let decomposition = decompose(&manager, specs, registry, limits)?;
+        self.tree
+            .seats
+            .extend(decomposition.children.iter().cloned());
+        self.decomposed.insert(manager_id);
+        Ok(decomposition)
+    }
+
+    /// Validates and returns the assembled tree.
+    ///
+    /// # Errors
+    /// Every refusal from [`DelegationTree::validate`].
+    pub fn build(
+        self,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+    ) -> Result<DelegationTree, DelegationError> {
+        self.tree.validate(registry, limits)?;
+        Ok(self.tree)
     }
 }
 
@@ -974,8 +1380,10 @@ pub enum SeatStatus {
     Failed,
     /// The seat could not start or finish because an input/tool was missing.
     Blocked,
-    /// The seat was cancelled/killed/interrupted before finishing.
+    /// The seat was cancelled by the operator/run before finishing.
     Cancelled,
+    /// The seat was explicitly killed (`KILL_WORKER`).
+    Killed,
 }
 
 impl SeatStatus {
@@ -987,6 +1395,7 @@ impl SeatStatus {
             SeatStatus::Failed => "failed",
             SeatStatus::Blocked => "blocked",
             SeatStatus::Cancelled => "cancelled",
+            SeatStatus::Killed => "killed",
         }
     }
 
@@ -994,6 +1403,39 @@ impl SeatStatus {
     #[must_use]
     pub fn is_success(self) -> bool {
         matches!(self, SeatStatus::Completed)
+    }
+
+    /// Maps the engine's durable [`AgentState`] to a seat outcome.
+    ///
+    /// `Completed` is the only state that maps to [`SeatStatus::Completed`].
+    /// `Killed` stays distinguishable from a voluntary `Cancelled`, and an
+    /// `Interrupted` task (crash/restart) is conservatively `Cancelled`: the
+    /// protocol never invents a successful result for work that did not settle.
+    /// Non-terminal states return `None`; a ledger is only rebuilt from settled
+    /// rows, and callers must surface the still-running task by name.
+    #[must_use]
+    pub fn from_agent_state(state: AgentState) -> Option<Self> {
+        match state {
+            AgentState::Completed => Some(SeatStatus::Completed),
+            AgentState::Failed => Some(SeatStatus::Failed),
+            AgentState::Cancelled => Some(SeatStatus::Cancelled),
+            AgentState::Killed => Some(SeatStatus::Killed),
+            AgentState::Interrupted => Some(SeatStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Parses the stable label; unknown text is `None`, never guessed.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "completed" => Some(SeatStatus::Completed),
+            "failed" => Some(SeatStatus::Failed),
+            "blocked" => Some(SeatStatus::Blocked),
+            "cancelled" | "canceled" => Some(SeatStatus::Cancelled),
+            "killed" => Some(SeatStatus::Killed),
+            _ => None,
+        }
     }
 }
 
@@ -1063,6 +1505,17 @@ impl SeatReport {
             refusal: None,
         }
     }
+
+    /// An explicitly killed result (`KILL_WORKER`), never success.
+    #[must_use]
+    pub fn killed(seat_id: TaskId, body: impl Into<String>) -> Self {
+        Self {
+            seat_id,
+            status: SeatStatus::Killed,
+            body: body.into(),
+            refusal: None,
+        }
+    }
 }
 
 /// Per-status counts over the whole tree (root included).
@@ -1078,6 +1531,9 @@ pub struct SeatCounts {
     pub blocked: usize,
     /// Seats that were cancelled.
     pub cancelled: usize,
+    /// Seats that were explicitly killed.
+    #[serde(default)]
+    pub killed: usize,
 }
 
 impl SeatCounts {
@@ -1112,8 +1568,14 @@ pub struct SeatSynthesisEntry {
 pub struct TreeSynthesis {
     /// CEO root seat id.
     pub tree_root: TaskId,
-    /// Root per-tree digest over the structure and every result.
+    /// Root per-tree digest over the whole structure and every result. It is
+    /// exactly `subtree_digests[tree_root]`.
     pub root_digest: String,
+    /// Digest for every seat's subtree, keyed by that subtree's root seat id.
+    /// A manager can publish/compare its own branch digest without including a
+    /// sibling branch, while the CEO's root digest still covers everything.
+    #[serde(default)]
+    pub subtree_digests: BTreeMap<TaskId, String>,
     /// Per-status counts.
     pub counts: SeatCounts,
     /// True only when every seat completed.
@@ -1122,6 +1584,115 @@ pub struct TreeSynthesis {
     pub entries: Vec<SeatSynthesisEntry>,
     /// Human-readable bottom-up synthesis for the root prompt.
     pub summary: String,
+}
+
+impl TreeSynthesis {
+    /// Digest of the subtree rooted at `tree_root` (any seat id).
+    ///
+    /// `tree_root` equal to [`TreeSynthesis::tree_root`] returns the root digest.
+    #[must_use]
+    pub fn subtree_digest(&self, tree_root: TaskId) -> Option<&str> {
+        self.subtree_digests.get(&tree_root).map(String::as_str)
+    }
+
+    /// Every per-subtree digest, keyed by the subtree root seat id.
+    #[must_use]
+    pub fn per_tree_digests(&self) -> &BTreeMap<TaskId, String> {
+        &self.subtree_digests
+    }
+}
+
+/// One persisted task row, as needed to rebuild a report ledger.
+///
+/// This is the durable row shape the engine already writes for every seat
+/// (`entities::TaskRecord`): identity, run, parent, role, depth and the settled
+/// [`AgentState`]. The result body lives in the task-results table, so it is
+/// supplied separately through [`TaskResultSource`] — the persistence port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRow {
+    /// Persisted task id (must equal the seat id).
+    pub task_id: TaskId,
+    /// Owning run.
+    pub run_id: RunId,
+    /// Persisted parent (`None` for the run root).
+    pub parent_task_id: Option<TaskId>,
+    /// Persisted role/persona.
+    pub role: String,
+    /// Persisted depth.
+    pub depth: u8,
+    /// Persisted, settled lifecycle state.
+    pub state: AgentState,
+}
+
+impl TaskRow {
+    /// Builds the view from already-extracted task-row fields.
+    #[must_use]
+    pub fn new(
+        task_id: TaskId,
+        run_id: RunId,
+        parent_task_id: Option<TaskId>,
+        role: impl Into<String>,
+        depth: u8,
+        state: AgentState,
+    ) -> Self {
+        Self {
+            task_id,
+            run_id,
+            parent_task_id,
+            role: role.into(),
+            depth,
+            state,
+        }
+    }
+}
+
+/// Persistence port for the result body and recorded refusal of one task.
+///
+/// Production adapters read the `task_results` table and (when available) the
+/// run/task `error_code`. Tests use the same trait for a scripted source, so a
+/// rebuild never relies on an in-memory success shortcut. Implementations must
+/// return `Ok(None)` when the task has no recorded result; they must not invent
+/// one.
+pub trait TaskResultSource: fmt::Debug {
+    /// Recorded final text for `task_id`, if any.
+    ///
+    /// # Errors
+    /// The store's named database/internal refusal.
+    fn task_result(&self, task_id: TaskId) -> Result<Option<String>, Refusal>;
+
+    /// Recorded named refusal for `task_id`, if any. Defaults to none.
+    ///
+    /// # Errors
+    /// The store's named database/internal refusal.
+    fn task_refusal(&self, _task_id: TaskId) -> Result<Option<Refusal>, Refusal> {
+        Ok(None)
+    }
+}
+
+/// A source that has no recorded results. Only non-completed rows can be
+/// rebuilt through it; a `Completed` row is refused rather than given a
+/// fabricated success body.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoTaskResults;
+
+impl TaskResultSource for NoTaskResults {
+    fn task_result(&self, _task_id: TaskId) -> Result<Option<String>, Refusal> {
+        Ok(None)
+    }
+}
+
+/// Production adapter: the durable task-results table is the result source.
+///
+/// Gated only for the legacy `#[path]` tests (they have no `crate::store`).
+/// Pass `&engine.store` directly to
+/// [`ReportLedger::from_task_records`]; the task `error_code` is stored at the
+/// run level in this schema, so a task-scoped refusal is `None` rather than
+/// guessed from prose.
+#[cfg(not(test))]
+impl TaskResultSource for crate::store::RunStore {
+    fn task_result(&self, task_id: TaskId) -> Result<Option<String>, Refusal> {
+        crate::store::RunStore::task_result(self, task_id)
+    }
 }
 
 /// Receives seat results bottom-up and refuses lies.
@@ -1226,6 +1797,172 @@ impl ReportLedger {
         Ok(())
     }
 
+    /// Rebuilds a per-run ledger from persisted task rows and recorded results.
+    ///
+    /// Every row is checked against the validated tree: one row per seat, same
+    /// run, same parent and depth, and a role that maps to the seat tier. Every
+    /// row must be terminal. A `Completed` row with no recorded result is
+    /// refused (never given a synthetic success body); `Failed`/`Cancelled`/
+    /// `Killed` rows without a body get an explicit non-success explanation.
+    ///
+    /// Reports are submitted in deepest-first order, so the normal bottom-up
+    /// rules apply: a completed parent over a non-completed child is refused.
+    ///
+    /// # Errors
+    /// `E_TASK_NOT_FOUND` for a missing/extra seat row; `E_SCHEMA_INVALID` for
+    /// duplicate rows, a non-terminal task, a run/parent/depth/role mismatch, a
+    /// `Completed` row with no result, or any bottom-up violation; plus the
+    /// store's named refusal from [`TaskResultSource`].
+    pub fn rebuild_from_task_rows(
+        tree: DelegationTree,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+        rows: &[TaskRow],
+        results: &dyn TaskResultSource,
+    ) -> Result<Self, DelegationError> {
+        tree.validate(registry, limits)?;
+        if rows.is_empty() {
+            return Err(invalid(
+                "cannot rebuild a report ledger from zero task rows",
+            ));
+        }
+        let mut by_id: HashMap<TaskId, &TaskRow> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            if by_id.insert(row.task_id, row).is_some() {
+                return Err(invalid(format!(
+                    "duplicate persisted task row {}",
+                    row.task_id
+                )));
+            }
+        }
+        let run_id = rows[0].run_id;
+        if rows.iter().any(|row| row.run_id != run_id) {
+            return Err(invalid(
+                "task rows from more than one run were supplied to one ledger",
+            ));
+        }
+        let mut ledger = Self::new(tree, registry, limits)?;
+        let mut reports: HashMap<TaskId, SeatReport> = HashMap::with_capacity(rows.len());
+        for seat in ledger.tree.seats() {
+            let row = by_id.get(&seat.seat_id).ok_or_else(|| {
+                DelegationError::new(
+                    Refusal::TaskNotFound,
+                    format!("seat {} has no persisted task row", seat.seat_id),
+                )
+            })?;
+            if row.run_id != run_id {
+                return Err(invalid(format!(
+                    "seat {} belongs to run {} but the ledger is run {run_id}",
+                    seat.seat_id, row.run_id
+                )));
+            }
+            let row_tier = SeatTier::from_label(&row.role).ok_or_else(|| {
+                invalid(format!(
+                    "task {} has role `{}` which maps to no seat tier",
+                    row.task_id, row.role
+                ))
+            })?;
+            if row_tier != seat.tier {
+                return Err(invalid(format!(
+                    "task {} role `{}` is a {} seat but the tree has a {} seat",
+                    row.task_id,
+                    row.role,
+                    row_tier.label(),
+                    seat.tier.label()
+                )));
+            }
+            if row.parent_task_id != seat.parent_seat_id {
+                return Err(invalid(format!(
+                    "task {} persisted parent {:?} but the seat parent is {:?}",
+                    row.task_id, row.parent_task_id, seat.parent_seat_id
+                )));
+            }
+            if row.depth != seat.depth {
+                return Err(invalid(format!(
+                    "task {} persisted depth {} but the seat depth is {}",
+                    row.task_id, row.depth, seat.depth
+                )));
+            }
+            let status = SeatStatus::from_agent_state(row.state).ok_or_else(|| {
+                invalid(format!(
+                    "task {} is {} (not terminal); a report ledger can only be rebuilt from settled rows",
+                    row.task_id,
+                    row.state.as_str()
+                ))
+            })?;
+            let recorded = results.task_result(row.task_id).map_err(|refusal| {
+                DelegationError::new(
+                    refusal,
+                    format!(
+                        "could not read the recorded result for task {}: {}",
+                        row.task_id,
+                        refusal.message()
+                    ),
+                )
+            })?;
+            let body = match (status, recorded) {
+                (SeatStatus::Completed, Some(body)) if !body.trim().is_empty() => body,
+                (SeatStatus::Completed, Some(_)) => {
+                    return Err(invalid(format!(
+                        "task {} is Completed with an empty recorded result; refusing to invent a success body",
+                        row.task_id
+                    )));
+                }
+                (SeatStatus::Completed, None) => {
+                    return Err(invalid(format!(
+                        "task {} is Completed with no recorded result; refusing to invent a success body",
+                        row.task_id
+                    )));
+                }
+                (_, Some(body)) if !body.trim().is_empty() => body,
+                (status, _) => format!(
+                    "task {} settled {} with no recorded result body",
+                    row.task_id,
+                    status.label()
+                ),
+            };
+            let refusal = results.task_refusal(row.task_id).map_err(|refusal| {
+                DelegationError::new(
+                    refusal,
+                    format!(
+                        "could not read the recorded refusal for task {}: {}",
+                        row.task_id,
+                        refusal.message()
+                    ),
+                )
+            })?;
+            reports.insert(
+                row.task_id,
+                SeatReport {
+                    seat_id: row.task_id,
+                    status,
+                    body,
+                    refusal,
+                },
+            );
+        }
+        // Rows that do not map to a seat mean the supplied tree is not the
+        // run's tree. Refuse instead of silently dropping a task's work.
+        for row in rows {
+            if ledger.tree.seat(row.task_id).is_none() {
+                return Err(invalid(format!(
+                    "persisted task {} is not a seat of this delegation tree",
+                    row.task_id
+                )));
+            }
+        }
+        for seat_id in ledger.tree.bottom_up_order() {
+            let report = reports.remove(&seat_id).ok_or_else(|| {
+                DelegationError::new(
+                    Refusal::InternalError,
+                    format!("seat {seat_id} lost its rebuilt report"),
+                )
+            })?;
+            ledger.submit(report)?;
+        }
+        Ok(ledger)
+    }
+
     /// Consumes the ledger and synthesizes the tree.
     ///
     /// # Errors
@@ -1243,10 +1980,44 @@ impl ReportLedger {
     }
 }
 
-fn validate_report(
-    report: &SeatReport,
-    limits: &DelegationLimits,
-) -> Result<(), DelegationError> {
+/// Direct `entities::TaskRecord` adapter (gated only for the legacy
+/// `#[path]` tests; see [`Seat::from_plan_node`]).
+#[cfg(not(test))]
+impl ReportLedger {
+    /// Rebuilds a per-run ledger directly from `entities::TaskRecord` rows.
+    ///
+    /// The result body is read through the [`TaskResultSource`] persistence
+    /// port. This is the production restore path: the engine lists
+    /// `RunStore::tasks_for_run(run_id)` and passes the same `RunStore` as the
+    /// port (or a small adapter over `task_result`/`task_error`).
+    ///
+    /// # Errors
+    /// Every refusal from [`ReportLedger::rebuild_from_task_rows`].
+    pub fn from_task_records(
+        tree: DelegationTree,
+        registry: &ToolRegistry,
+        limits: &DelegationLimits,
+        rows: &[crate::entities::TaskRecord],
+        results: &dyn TaskResultSource,
+    ) -> Result<Self, DelegationError> {
+        let views: Vec<TaskRow> = rows
+            .iter()
+            .map(|row| {
+                TaskRow::new(
+                    row.id,
+                    row.run_id,
+                    row.parent_task_id,
+                    row.role.clone(),
+                    row.depth,
+                    row.state,
+                )
+            })
+            .collect();
+        Self::rebuild_from_task_rows(tree, registry, limits, &views, results)
+    }
+}
+
+fn validate_report(report: &SeatReport, limits: &DelegationLimits) -> Result<(), DelegationError> {
     let characters = report.body.chars().count();
     if characters > limits.max_report_chars {
         return Err(invalid(format!(
@@ -1286,7 +2057,7 @@ fn validate_report(
                 )));
             }
         }
-        SeatStatus::Cancelled => {}
+        SeatStatus::Cancelled | SeatStatus::Killed => {}
     }
     Ok(())
 }
@@ -1330,9 +2101,9 @@ fn build_synthesis(
     tree: &DelegationTree,
     reports: &BTreeMap<TaskId, SeatReport>,
 ) -> Result<TreeSynthesis, DelegationError> {
-    let root = tree
-        .root()
-        .ok_or_else(|| DelegationError::new(Refusal::InternalError, "validated tree has no root"))?;
+    let root = tree.root().ok_or_else(|| {
+        DelegationError::new(Refusal::InternalError, "validated tree has no root")
+    })?;
     let mut counts = SeatCounts::default();
     let mut entries = Vec::with_capacity(tree.seats().len());
     for seat_id in tree.bottom_up_order() {
@@ -1353,6 +2124,7 @@ fn build_synthesis(
             SeatStatus::Failed => counts.failed += 1,
             SeatStatus::Blocked => counts.blocked += 1,
             SeatStatus::Cancelled => counts.cancelled += 1,
+            SeatStatus::Killed => counts.killed += 1,
         }
         entries.push(SeatSynthesisEntry {
             seat_id,
@@ -1366,11 +2138,21 @@ fn build_synthesis(
     }
     counts.total = tree.seats().len();
     let succeeded = counts.completed == counts.total;
-    let root_digest = tree_digest(tree, reports)?;
+    let mut subtree_digests = BTreeMap::new();
+    for seat in tree.seats() {
+        subtree_digests.insert(seat.seat_id, subtree_digest(tree, reports, seat.seat_id)?);
+    }
+    let root_digest = subtree_digests.get(&root.seat_id).cloned().ok_or_else(|| {
+        DelegationError::new(
+            Refusal::InternalError,
+            "validated delegation tree has no root digest",
+        )
+    })?;
     let summary = build_summary(tree, reports, &counts, &root_digest)?;
     Ok(TreeSynthesis {
         tree_root: root.seat_id,
         root_digest,
+        subtree_digests,
         counts,
         succeeded,
         entries,
@@ -1384,18 +2166,19 @@ fn build_summary(
     counts: &SeatCounts,
     root_digest: &str,
 ) -> Result<String, DelegationError> {
-    let root = tree
-        .root()
-        .ok_or_else(|| DelegationError::new(Refusal::InternalError, "validated tree has no root"))?;
+    let root = tree.root().ok_or_else(|| {
+        DelegationError::new(Refusal::InternalError, "validated tree has no root")
+    })?;
     let mut summary = format!(
-        "Delegation tree {}: {}/{} seats completed; {} failed, {} blocked, {} cancelled. \
-         Only Completed seats count as success. Root digest: {}.\n",
+        "Delegation tree {}: {}/{} seats completed; {} failed, {} blocked, {} cancelled, \
+         {} killed. Only Completed seats count as success. Root digest: {}.\n",
         root.seat_id,
         counts.completed,
         counts.total,
         counts.failed,
         counts.blocked,
         counts.cancelled,
+        counts.killed,
         root_digest
     );
     for seat_id in tree.bottom_up_order() {
@@ -1432,21 +2215,54 @@ fn build_summary(
     Ok(summary)
 }
 
-fn tree_digest(
+/// Whether `candidate` is `subtree_root` or one of its descendants.
+fn in_subtree(tree: &DelegationTree, candidate: TaskId, subtree_root: TaskId) -> bool {
+    let mut cursor = Some(candidate);
+    let mut hops = 0usize;
+    while let Some(id) = cursor {
+        if id == subtree_root {
+            return true;
+        }
+        hops = hops.saturating_add(1);
+        if hops > tree.seats().len() {
+            return false;
+        }
+        cursor = tree.seat(id).and_then(|seat| seat.parent_seat_id);
+    }
+    false
+}
+
+/// Digest of one subtree (the seat named `subtree_root` plus all descendants).
+///
+/// The whole-tree root digest is `subtree_digest(tree, reports, tree.root)`, so
+/// there is exactly one canonicalization function for both.
+fn subtree_digest(
     tree: &DelegationTree,
     reports: &BTreeMap<TaskId, SeatReport>,
+    subtree_root: TaskId,
 ) -> Result<String, DelegationError> {
-    let root = tree
-        .root()
-        .ok_or_else(|| DelegationError::new(Refusal::InternalError, "validated tree has no root"))?;
+    let root = tree.root().ok_or_else(|| {
+        DelegationError::new(Refusal::InternalError, "validated tree has no root")
+    })?;
+    if tree.seat(subtree_root).is_none() {
+        return Err(DelegationError::new(
+            Refusal::TaskNotFound,
+            format!("digest requested for unknown seat {subtree_root}"),
+        ));
+    }
+    let mut members: Vec<&Seat> = tree
+        .seats()
+        .iter()
+        .filter(|seat| in_subtree(tree, seat.seat_id, subtree_root))
+        .collect();
+    members.sort_by_key(|seat| (seat.depth, seat.seat_id));
     let mut canonical = String::new();
     canonical.push_str(DIGEST_DOMAIN);
     canonical.push('\n');
-    canonical.push_str(&format!("root={}\n", root.seat_id));
-    canonical.push_str(&format!("seats={}\n", tree.seats().len()));
-    let mut ordered: Vec<&Seat> = tree.seats().iter().collect();
-    ordered.sort_by_key(|seat| (seat.depth, seat.seat_id));
-    for seat in ordered {
+    canonical.push_str(&format!("subtree_root={}\n", subtree_root));
+    canonical.push_str(&format!("run_root={}\n", root.seat_id));
+    canonical.push_str(&format!("seats={}\n", members.len()));
+    for seat in members {
         let report = reports.get(&seat.seat_id).ok_or_else(|| {
             DelegationError::new(
                 Refusal::InternalError,
@@ -1456,16 +2272,11 @@ fn tree_digest(
         let parent = seat
             .parent_seat_id
             .map_or_else(|| "none".to_owned(), |id| id.to_string());
-        let refusal = report
-            .refusal
-            .map_or("none", |refusal| refusal.code());
+        let refusal = report.refusal.map_or("none", |refusal| refusal.code());
         let mut tools: Vec<&str> = seat.tools.iter().map(|tool| tool.id()).collect();
         tools.sort_unstable();
-        let mut dependencies: Vec<String> = seat
-            .depends_on
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let mut dependencies: Vec<String> =
+            seat.depends_on.iter().map(ToString::to_string).collect();
         dependencies.sort_unstable();
         canonical.push_str(&format!(
             "seat={} parent={} tier={} depth={} status={} refusal={} brief_sha256={} \
@@ -1494,8 +2305,7 @@ fn tree_digest(
 
 fn clip_plain(text: &str, max_chars: usize) -> String {
     let mut clipped = String::new();
-    let mut taken = 0usize;
-    for character in text.trim().chars() {
+    for (taken, character) in text.trim().chars().enumerate() {
         if taken >= max_chars {
             break;
         }
@@ -1504,7 +2314,6 @@ fn clip_plain(text: &str, max_chars: usize) -> String {
         } else {
             character
         });
-        taken += 1;
     }
     clipped
 }
@@ -1595,8 +2404,11 @@ mod tests {
         let error = validate_brief(&long, &limits()).expect_err("too long");
         assert_eq!(error.refusal(), Refusal::SchemaInvalid);
         assert!(error.detail().contains("cap"));
-        validate_brief("Fix the login redirect and add a regression test.", &limits())
-            .expect("plain-English brief");
+        validate_brief(
+            "Fix the login redirect and add a regression test.",
+            &limits(),
+        )
+        .expect("plain-English brief");
     }
 
     #[test]
@@ -1661,8 +2473,13 @@ mod tests {
             tools: Vec::new(),
             depends_on: Vec::new(),
         };
-        let error = decompose(&assistant, std::slice::from_ref(&spec), &registry(), &limits())
-            .expect_err("assistant cannot delegate");
+        let error = decompose(
+            &assistant,
+            std::slice::from_ref(&spec),
+            &registry(),
+            &limits(),
+        )
+        .expect_err("assistant cannot delegate");
         assert_eq!(error.refusal(), Refusal::ToolNotAllowed);
     }
 
@@ -1718,7 +2535,9 @@ mod tests {
         )
         .expect("child");
         let tree = DelegationTree::new(vec![ceo, first, second]);
-        let error = tree.validate(&registry(), &limits()).expect_err("duplicate");
+        let error = tree
+            .validate(&registry(), &limits())
+            .expect_err("duplicate");
         assert_eq!(error.refusal(), Refusal::SchemaInvalid);
     }
 
@@ -1762,8 +2581,8 @@ mod tests {
             SeatReport::completed(ids[1], "The backend track is verified."),
             SeatReport::completed(ids[0], "The release is ready."),
         ];
-        let first = synthesize_batch(tree.clone(), &registry, &limits, reports.clone())
-            .expect("synthesis");
+        let first =
+            synthesize_batch(tree.clone(), &registry, &limits, reports.clone()).expect("synthesis");
         let reversed: Vec<SeatReport> = reports.into_iter().rev().collect();
         let second = synthesize_batch(tree, &registry, &limits, reversed).expect("synthesis");
         assert!(first.succeeded);

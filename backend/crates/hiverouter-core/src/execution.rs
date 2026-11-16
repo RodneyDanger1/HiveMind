@@ -231,7 +231,7 @@ pub fn terminal_verified(
             continue;
         }
         match plan.tool.as_str() {
-            "file_write" | "apply_patch" => {
+            "file_write" | "apply_patch" | "checkpoint_restore" => {
                 mutated = true;
                 verified = false;
             }

@@ -18,6 +18,7 @@ use hivewire::{
     WireEnvelope,
 };
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "hivewire-scheduler-token-0123456789";
 const REMOTE: &str = "remote-a";
@@ -90,7 +91,10 @@ fn lease_expiry_requeues_a_task_exactly_once() {
     std::thread::sleep(Duration::from_millis(70));
 
     let third = scheduler.tick("daemon-1").expect("third tick");
-    assert_eq!(third.requeued, 1, "the stale lease is returned to the queue once");
+    assert_eq!(
+        third.requeued, 1,
+        "the stale lease is returned to the queue once"
+    );
     assert_eq!(third.leased.len(), 1, "and re-leased in the same tick");
     assert_eq!(third.leased[0].message_id, "msg-task-1");
     assert_eq!(third.leased[0].attempts, 2);
@@ -213,6 +217,113 @@ fn scheduler_bounds_are_validated() {
     let scheduler = DaemonScheduler::new(database, 100, 3, 1).expect("valid scheduler");
     assert_eq!(
         scheduler.tick("   ").expect_err("empty owner").code(),
+        "E_HIVEWIRE_CONFIG"
+    );
+}
+
+#[test]
+fn run_loop_leases_until_cancelled_and_reports_work() {
+    let (_temp, database) = database();
+    let store = store_with_capacity(database.clone(), 8);
+    let ack = handshake(&store);
+    enqueue(&store, &ack.session_id, ack.next_sequence, "task-loop-1");
+
+    let scheduler = DaemonScheduler::new(database, 5_000, 3, 8)
+        .expect("scheduler")
+        .with_generation("gen-loop");
+    let cancel = CancellationToken::new();
+    let thread_cancel = cancel.clone();
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let report = scheduler.run_loop(thread_cancel, Duration::from_millis(10), 8);
+        let _ = report_tx.send(report);
+    });
+
+    // Wait until the production loop has actually leased the task.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = store.pending_tasks(10).expect("pending");
+        if pending
+            .iter()
+            .any(|task| task.state == MessageState::Leased)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run_loop did not lease a ready task within 5 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Give the loop one live tick past its recovery tick, then cancel.
+    std::thread::sleep(Duration::from_millis(50));
+    cancel.cancel();
+
+    let report = report_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the loop must stop after cancellation")
+        .expect("the loop report");
+    handle.join().expect("loop thread joins");
+    assert!(report.cancelled, "the loop must report its cancellation");
+    assert!(report.ticks >= 1, "at least one live tick ran");
+    assert!(report.tasks_leased >= 1, "the loop leased real work");
+    assert_eq!(report.recovery_ticks, 1, "one crash-recovery tick at start");
+    assert_eq!(report.errors, 0, "a healthy loop reports no errors");
+}
+
+#[tokio::test]
+async fn run_loop_async_cancels_promptly() {
+    let (_temp, database) = database();
+    let store = store_with_capacity(database.clone(), 4);
+    let ack = handshake(&store);
+    enqueue(&store, &ack.session_id, ack.next_sequence, "task-async-1");
+
+    let scheduler = Arc::new(
+        DaemonScheduler::new(database, 5_000, 3, 4)
+            .expect("scheduler")
+            .with_generation("gen-async"),
+    );
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(Arc::clone(&scheduler).run_loop_async(
+        cancel.clone(),
+        Duration::from_millis(10),
+        4,
+    ));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+    let report = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the async loop must stop after cancellation")
+        .expect("join")
+        .expect("report");
+    assert!(report.cancelled);
+    assert!(report.tasks_leased >= 1);
+}
+
+#[test]
+fn run_loop_rejects_zero_interval_batch_and_owner() {
+    let (_temp, database) = database();
+    let scheduler = DaemonScheduler::new(database, 100, 3, 1).expect("scheduler");
+    let cancel = CancellationToken::new();
+    assert_eq!(
+        scheduler
+            .run_loop(cancel.clone(), Duration::ZERO, 1)
+            .expect_err("zero interval")
+            .code(),
+        "E_HIVEWIRE_CONFIG"
+    );
+    assert_eq!(
+        scheduler
+            .run_loop(cancel.clone(), Duration::from_millis(1), 0)
+            .expect_err("zero batch")
+            .code(),
+        "E_HIVEWIRE_CONFIG"
+    );
+    assert_eq!(
+        scheduler
+            .run_loop_as("   ", cancel, Duration::from_millis(1), 1)
+            .expect_err("empty owner")
+            .code(),
         "E_HIVEWIRE_CONFIG"
     );
 }

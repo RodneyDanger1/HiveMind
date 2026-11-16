@@ -76,15 +76,24 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
+use async_trait::async_trait;
 use hiverouter_contract::{Refusal, RunId, Timestamp};
 use serde::Serialize;
 
 use crate::evolution_gate::verify_evaluation_receipt;
 use crate::store::{MemoryEntryRecord, RunStore};
 
-/// Identifier of the scoring algorithm, carried on every response so a caller
-/// never has to guess what produced a score.
+/// Identifier of the lexical scoring algorithm, carried on every response so a
+/// caller never has to guess what produced a score.
 pub const ALGORITHM: &str = "lexical-tfidf-cosine+char3gram-fuzzy; no embeddings; no ANN";
+
+/// Identifier of the exact-vector scoring algorithm. There is no approximate
+/// nearest-neighbour search and no ANN dependency.
+pub const VECTOR_ALGORITHM: &str = "exact-f32-cosine; no ANN";
+/// Hard ceiling on entries one vector recall may score.
+pub const MAX_VECTOR_ENTRIES: usize = 4_096;
+/// Hard ceiling on an embedding dimension accepted by hybrid recall.
+pub const MAX_EMBEDDING_DIM: usize = 8_192;
 
 /// Hard ceiling on the number of persisted entries one index may cover.
 pub const MAX_INDEXED_ENTRIES: usize = 4096;
@@ -127,11 +136,11 @@ pub const MAX_FUZZY_CANDIDATES: usize = 512;
 const STOPWORDS: &[&str] = &[
     "a", "about", "after", "all", "also", "an", "and", "any", "are", "as", "at", "be", "been",
     "before", "but", "by", "can", "could", "did", "do", "does", "for", "from", "had", "has",
-    "have", "how", "if", "in", "into", "is", "it", "its", "may", "me", "might", "must", "my",
-    "no", "not", "of", "on", "or", "our", "over", "should", "so", "some", "such", "than", "that",
-    "the", "their", "then", "there", "these", "they", "this", "those", "to", "under", "up", "us",
-    "use", "used", "using", "was", "we", "were", "what", "when", "where", "which", "who", "why",
-    "will", "with", "would", "you", "your",
+    "have", "how", "if", "in", "into", "is", "it", "its", "may", "me", "might", "must", "my", "no",
+    "not", "of", "on", "or", "our", "over", "should", "so", "some", "such", "than", "that", "the",
+    "their", "then", "there", "these", "they", "this", "those", "to", "under", "up", "us", "use",
+    "used", "using", "was", "we", "were", "what", "when", "where", "which", "who", "why", "will",
+    "with", "would", "you", "your",
 ];
 
 /// Deterministic suffix stems, longest first.
@@ -171,6 +180,21 @@ pub enum RecallError {
         /// Which bound was hit.
         reason: &'static str,
     },
+    /// The caller named a model id that the supplied embedder does not serve.
+    ///
+    /// This is a hard refusal, never a silent fallback: a query embedded with
+    /// one model must never be compared against vectors from another.
+    UnknownModel {
+        /// Model id the caller requested.
+        requested: String,
+        /// Model id the embedder actually serves.
+        available: String,
+    },
+    /// The embedder declared a dimension outside `1..=MAX_EMBEDDING_DIM`.
+    InvalidModelDim {
+        /// Declared dimension.
+        dim: usize,
+    },
     /// A named store refusal from the persistence layer.
     Store(Refusal),
 }
@@ -187,6 +211,8 @@ impl RecallError {
             Self::InvalidLimit { .. } => "E_RECALL_INVALID_LIMIT",
             Self::InvalidScore => "E_RECALL_INVALID_SCORE",
             Self::IndexBound { .. } => "E_RECALL_INDEX_BOUND",
+            Self::UnknownModel { .. } => "E_RECALL_UNKNOWN_MODEL",
+            Self::InvalidModelDim { .. } => "E_RECALL_MODEL_DIM",
             Self::Store(refusal) => refusal.code(),
         }
     }
@@ -208,8 +234,20 @@ impl RecallError {
             Self::InvalidLimit { limit } => {
                 format!("semantic recall limit {limit} is outside 1..={MAX_HITS}")
             }
-            Self::InvalidScore => "semantic recall min_score must be finite and in 0.0..=1.0".to_owned(),
+            Self::InvalidScore => {
+                "semantic recall min_score must be finite and in 0.0..=1.0".to_owned()
+            }
             Self::IndexBound { reason } => format!("semantic recall index bound: {reason}"),
+            Self::UnknownModel {
+                requested,
+                available,
+            } => format!(
+                "semantic recall refused unknown embedding model {requested:?}; \
+                 the supplied embedder serves {available:?}"
+            ),
+            Self::InvalidModelDim { dim } => format!(
+                "semantic recall embedder dimension {dim} is outside 1..={MAX_EMBEDDING_DIM}"
+            ),
             Self::Store(refusal) => refusal.message().to_owned(),
         }
     }
@@ -343,6 +381,108 @@ impl<'a> RecallQuery<'a> {
         self.min_score = min_score;
         self
     }
+}
+
+/// A named embedding failure surfaced to the hybrid recall path.
+///
+/// The code is stable and machine-readable; the message is human-facing detail.
+/// Hybrid recall turns a query-embedding failure into an explicit lexical
+/// fallback, so the caller still receives recall hits plus the exact reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueryEmbedError {
+    /// Stable failure code (for example `E_EMBEDDING_TIMEOUT`).
+    pub code: String,
+    /// Human-readable cause; never contains a credential or query body.
+    pub message: String,
+}
+
+impl QueryEmbedError {
+    /// Builds a named embedding failure.
+    #[must_use]
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for QueryEmbedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for QueryEmbedError {}
+
+/// The narrow embedding view hybrid recall needs.
+///
+/// This trait deliberately lives beside the hybrid API so `semantic_recall`
+/// stays compilable without the optional [`crate::embeddings`] module. The full
+/// [`crate::embeddings::Embedder`] trait is the provider-neutral embedding
+/// contract; its loopback adapter implements both. Cosine is part of this trait
+/// so the scorer used by hybrid recall is explicit and independently testable.
+#[async_trait]
+pub trait QueryEmbedder: Send + Sync {
+    /// Model id that produced the vectors and query embedding.
+    fn model_id(&self) -> &str;
+
+    /// Vector width the embedder produces.
+    fn dim(&self) -> usize;
+
+    /// Embeds each text, returning one vector per input in order.
+    ///
+    /// # Errors
+    /// A named [`QueryEmbedError`] for input/transport/response failures.
+    async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, QueryEmbedError>;
+
+    /// Exact f32 cosine similarity, clamped to `-1.0..=1.0`.
+    ///
+    /// # Errors
+    /// A named [`QueryEmbedError`] for empty/unequal shapes, non-finite
+    /// components, or a zero norm.
+    fn cosine(&self, query: &[f32], candidate: &[f32]) -> Result<f32, QueryEmbedError>;
+}
+
+/// Model metadata carried by a hybrid recall response so the caller can tell
+/// exactly which embedder produced (or failed to produce) the vector path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HybridModelMetadata {
+    /// Model id named by the caller.
+    pub model_id: String,
+    /// Vector width declared by the embedder.
+    pub dim: usize,
+}
+
+/// Hybrid recall result.
+///
+/// `degraded == false` means every indexed candidate had a complete vector for
+/// the named model and the query was embedded successfully; `hits` were scored
+/// by exact cosine. `degraded == true` means the existing lexical hits are
+/// returned unchanged and `degraded_reason` names exactly why the vector path
+/// was unavailable. Degradation never upgrades trust: every hit keeps the
+/// provenance/verification of its persisted row in both modes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HybridRecallResponse {
+    /// Ranked hits: vector cosine when complete, lexical otherwise.
+    pub hits: Vec<RecallHit>,
+    /// Stemmed lexical query tokens (still reported in both modes).
+    pub query_terms: Vec<String>,
+    /// Number of documents in the lexical index.
+    pub indexed_entries: usize,
+    /// Quarantined rows excluded from the index.
+    pub quarantined_excluded: usize,
+    /// Algorithm that actually produced `hits` ([`VECTOR_ALGORITHM`] or
+    /// [`ALGORITHM`]).
+    pub algorithm: &'static str,
+    /// True when the vector path was unavailable and lexical hits were used.
+    pub degraded: bool,
+    /// Exact reason for degradation; `None` only when `degraded` is false.
+    pub degraded_reason: Option<String>,
+    /// Model metadata from the supplied embedder.
+    pub model: HybridModelMetadata,
+    /// Entries that contributed a vector to the vector path (`0` when degraded).
+    pub vector_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -578,20 +718,7 @@ impl SemanticIndex {
             if score < query.min_score {
                 continue;
             }
-            let verification = Verification::from_trust(document.trust.as_deref());
-            hits.push(RecallHit {
-                entry_id: document.entry_id.clone(),
-                bank_id: document.bank_id.clone(),
-                key: document.key.clone(),
-                score,
-                provenance: RecallProvenance {
-                    source_kind: document.source_kind.clone(),
-                    trust: document.trust.clone(),
-                    verification,
-                    verified: verification.is_verified(),
-                },
-                excerpt: document.excerpt.clone(),
-            });
+            hits.push(hit_for_document(document, score));
         }
         hits.sort_by(|left, right| {
             right
@@ -648,8 +775,95 @@ impl SemanticIndex {
                 *vector.entry(term_id).or_insert(0.0) += FUZZY_WEIGHT * dice;
             }
         }
-        let norm = vector.values().map(|weight| weight * weight).sum::<f64>().sqrt();
+        let norm = vector
+            .values()
+            .map(|weight| weight * weight)
+            .sum::<f64>()
+            .sqrt();
         (vector, norm)
+    }
+
+    /// Exact-cosine ranking over the indexed documents.
+    ///
+    /// The vector path is all-or-nothing: if any indexed candidate lacks a
+    /// vector of the declared width, the caller must fall back to lexical hits
+    /// rather than mixing incomparable scores. The returned error string is the
+    /// stable degraded reason.
+    fn vector_hits(
+        &self,
+        query_vector: &[f32],
+        vectors: &HashMap<String, Vec<f32>>,
+        query: &RecallQuery<'_>,
+        model_id: &str,
+        embedder: &dyn QueryEmbedder,
+    ) -> Result<Vec<RecallHit>, String> {
+        if self.documents.len() > MAX_VECTOR_ENTRIES {
+            return Err(format!(
+                "E_EMBEDDING_BOUND: {} indexed entries exceed MAX_VECTOR_ENTRIES {MAX_VECTOR_ENTRIES}",
+                self.documents.len()
+            ));
+        }
+        let dim = embedder.dim();
+        let mut missing = 0_usize;
+        for document in &self.documents {
+            match vectors.get(&document.entry_id) {
+                Some(vector) if vector.len() == dim => {}
+                Some(_) | None => missing += 1,
+            }
+        }
+        if missing > 0 {
+            return Err(format!(
+                "E_EMBEDDING_INCOMPLETE: {missing} of {} indexed entries lack a {dim}-dimension \
+                 vector for model {model_id}",
+                self.documents.len()
+            ));
+        }
+
+        let mut hits = Vec::with_capacity(self.documents.len());
+        for document in &self.documents {
+            let Some(vector) = vectors.get(&document.entry_id) else {
+                // Completeness was proven above; a missing value here is a
+                // concurrent mutation of caller-owned input, not a normal path.
+                return Err(format!(
+                    "E_EMBEDDING_INCOMPLETE: vector for entry {} disappeared during scoring",
+                    document.entry_id
+                ));
+            };
+            let cosine = embedder.cosine(query_vector, vector).map_err(|error| {
+                format!("E_EMBEDDING_VECTOR: {}: {}", error.code, error.message)
+            })?;
+            let score = f64::from(cosine.clamp(0.0, 1.0));
+            if score < query.min_score {
+                continue;
+            }
+            hits.push(hit_for_document(document, score));
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.entry_id.cmp(&right.entry_id))
+        });
+        hits.truncate(query.limit);
+        Ok(hits)
+    }
+}
+
+fn hit_for_document(document: &IndexedDocument, score: f64) -> RecallHit {
+    let verification = Verification::from_trust(document.trust.as_deref());
+    RecallHit {
+        entry_id: document.entry_id.clone(),
+        bank_id: document.bank_id.clone(),
+        key: document.key.clone(),
+        score,
+        provenance: RecallProvenance {
+            source_kind: document.source_kind.clone(),
+            trust: document.trust.clone(),
+            verification,
+            verified: verification.is_verified(),
+        },
+        excerpt: document.excerpt.clone(),
     }
 }
 
@@ -734,7 +948,8 @@ fn stem(token: &str) -> String {
                 stemmed.push_str("ate");
             }
             "s" => {
-                if !stemmed.ends_with("ss") && !stemmed.ends_with("us") && !stemmed.ends_with("is") {
+                if !stemmed.ends_with("ss") && !stemmed.ends_with("us") && !stemmed.ends_with("is")
+                {
                     stemmed.truncate(stemmed.len() - 1);
                 }
             }
@@ -810,7 +1025,8 @@ pub fn recall_bank(
     if bank_id.trim().is_empty() {
         return Err(RecallError::Store(Refusal::SchemaInvalid));
     }
-    let mut entries = store.memory_entries_for_bank_scoped(run_id, bank_id, MAX_BANK_ENTRIES + 1)?;
+    let mut entries =
+        store.memory_entries_for_bank_scoped(run_id, bank_id, MAX_BANK_ENTRIES + 1)?;
     if entries.len() > MAX_BANK_ENTRIES {
         entries.clear();
         return Err(RecallError::IndexBound {
@@ -877,6 +1093,148 @@ pub fn recall_run(
         });
     }
     SemanticIndex::build(&entries)?.recall(query)
+}
+
+/// Hybrid recall over already-loaded rows and already-loaded vectors.
+///
+/// # Contract
+///
+/// - **Vector path** (`degraded == false`): every indexed candidate has a vector
+///   for `expected_model` with exactly the embedder's dimension, the query is
+///   embedded, and hits are scored by exact cosine via
+///   [`QueryEmbedder::cosine`]. `algorithm` is [`VECTOR_ALGORITHM`].
+/// - **Lexical fallback** (`degraded == true`): the existing lexical hits are
+///   returned unchanged, `algorithm` is [`ALGORITHM`], and `degraded_reason`
+///   names the exact cause (embedding failure, incomplete coverage, missing
+///   vector, dimension mismatch, or scorer refusal). The fallback is explicit;
+///   it is never a silent "semantic" claim.
+/// - **Unknown model is a hard refusal**, never a fallback: a query embedded by
+///   a different model must not be compared against these vectors.
+/// - **Trust never moves**: every hit keeps the row's persisted trust and
+///   verification grade in both modes. Cosine is a relevance score only.
+///
+/// # Errors
+/// [`RecallError::EmptyStore`] for no rows;
+/// [`RecallError::UnknownModel`] for a blank/oversized/control-character
+/// model id or an embedder serving a different model;
+/// [`RecallError::InvalidModelDim`] for an invalid embedder dimension; plus the
+/// lexical build/query refusals ([`RecallError::CorruptStore`],
+/// [`RecallError::IndexBound`], [`RecallError::EmptyQuery`],
+/// [`RecallError::QueryTooLong`], [`RecallError::InvalidLimit`],
+/// [`RecallError::InvalidScore`]).
+pub async fn recall_hybrid(
+    entries: &[MemoryEntryRecord],
+    vectors: &HashMap<String, Vec<f32>>,
+    query: &RecallQuery<'_>,
+    embedder: &dyn QueryEmbedder,
+    expected_model: &str,
+) -> Result<HybridRecallResponse, RecallError> {
+    if entries.is_empty() {
+        return Err(RecallError::EmptyStore {
+            scope: "entries".to_owned(),
+        });
+    }
+    let model_id = expected_model.trim();
+    let available = embedder.model_id().trim();
+    if model_id.is_empty()
+        || model_id.len() > 128
+        || model_id.chars().any(char::is_control)
+        || available.is_empty()
+        || available != model_id
+    {
+        return Err(RecallError::UnknownModel {
+            requested: expected_model.to_owned(),
+            available: embedder.model_id().to_owned(),
+        });
+    }
+    let dim = embedder.dim();
+    if dim == 0 || dim > MAX_EMBEDDING_DIM {
+        return Err(RecallError::InvalidModelDim { dim });
+    }
+
+    let index = SemanticIndex::build(entries)?;
+    // Lexical scoring validates the query bounds and gives the fallback hits;
+    // running it first means a bad query fails by name even when vectors exist.
+    let lexical = index.recall(query)?;
+
+    let query_vector = match embedder.embed_texts(&[query.text]).await {
+        Ok(mut vectors) => {
+            if vectors.len() != 1 {
+                return Ok(hybrid_lexical_fallback(
+                    lexical,
+                    model_id,
+                    dim,
+                    format!(
+                        "E_EMBEDDING_VECTOR_COUNT: expected 1 query vector, received {}",
+                        vectors.len()
+                    ),
+                ));
+            }
+            vectors.remove(0)
+        }
+        Err(error) => {
+            return Ok(hybrid_lexical_fallback(
+                lexical,
+                model_id,
+                dim,
+                format!("E_EMBEDDING_QUERY: {}: {}", error.code, error.message),
+            ))
+        }
+    };
+    if query_vector.len() != dim {
+        return Ok(hybrid_lexical_fallback(
+            lexical,
+            model_id,
+            dim,
+            format!(
+                "E_EMBEDDING_DIM: query vector has {} dimensions, expected {dim}",
+                query_vector.len()
+            ),
+        ));
+    }
+
+    match index.vector_hits(&query_vector, vectors, query, model_id, embedder) {
+        Ok(hits) => {
+            let vector_entries = index.indexed_entries();
+            Ok(HybridRecallResponse {
+                hits,
+                query_terms: lexical.query_terms,
+                indexed_entries: lexical.indexed_entries,
+                quarantined_excluded: lexical.quarantined_excluded,
+                algorithm: VECTOR_ALGORITHM,
+                degraded: false,
+                degraded_reason: None,
+                model: HybridModelMetadata {
+                    model_id: model_id.to_owned(),
+                    dim,
+                },
+                vector_entries,
+            })
+        }
+        Err(reason) => Ok(hybrid_lexical_fallback(lexical, model_id, dim, reason)),
+    }
+}
+
+fn hybrid_lexical_fallback(
+    lexical: RecallResponse,
+    model_id: &str,
+    dim: usize,
+    reason: String,
+) -> HybridRecallResponse {
+    HybridRecallResponse {
+        hits: lexical.hits,
+        query_terms: lexical.query_terms,
+        indexed_entries: lexical.indexed_entries,
+        quarantined_excluded: lexical.quarantined_excluded,
+        algorithm: ALGORITHM,
+        degraded: true,
+        degraded_reason: Some(reason),
+        model: HybridModelMetadata {
+            model_id: model_id.to_owned(),
+            dim,
+        },
+        vector_entries: 0,
+    }
 }
 
 /// Explicit operator acknowledgement required for a lesson promotion. There is

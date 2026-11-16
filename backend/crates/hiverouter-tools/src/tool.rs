@@ -163,6 +163,8 @@ pub enum ToolId {
     RepoSearch,
     /// Ranked recall over this run's persisted memory banks.
     MemoryRecall,
+    /// Undo one journaled file mutation by its checkpoint id.
+    CheckpointRestore,
 }
 
 impl ToolId {
@@ -195,6 +197,7 @@ impl ToolId {
             ToolId::HarnessDiagnose => "harness_diagnose",
             ToolId::RepoSearch => "repo_search",
             ToolId::MemoryRecall => "memory_recall",
+            ToolId::CheckpointRestore => "checkpoint_restore",
         }
     }
 
@@ -414,6 +417,22 @@ pub struct MemoryRecallArgs {
     /// Maximum ranked hits (1..=50).
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+/// Arguments for [`ToolId::CheckpointRestore`].
+///
+/// Both fields are required and both are load-bearing: the checkpoint id names
+/// the one journaled entry to undo, and the path must be the exact
+/// workspace-relative path that entry was recorded for. An empty id, an
+/// oversized id, a stale/tampered pre-image, or a path that does not match the
+/// journal row is refused by the checkpoint journal before anything is written.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRestoreArgs {
+    /// Stable checkpoint id recorded by the workspace checkpoint journal.
+    pub checkpoint_id: String,
+    /// Workspace-relative path the checkpoint was recorded for; must match it.
+    pub path: String,
 }
 
 /// Arguments for [`ToolId::FileRead`].
@@ -812,6 +831,15 @@ impl ToolRegistry {
                 PermissionClass::Read,
                 schema_of!(MemoryRecallArgs),
             ),
+            contract(
+                ToolId::CheckpointRestore,
+                "Restore one journaled file checkpoint by id (requires approval). The path must be \
+                 exactly the workspace-relative path the checkpoint was recorded for; a stale, \
+                 tampered, or already-restored pre-image is refused, and the receipt names the \
+                 exact bytes written. Undo is not redo: re-applying a mutation needs a new write.",
+                PermissionClass::Mutate,
+                schema_of!(CheckpointRestoreArgs),
+            ),
         ] {
             contracts.insert(contract.id, contract);
         }
@@ -836,6 +864,7 @@ impl ToolRegistry {
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
                 ToolId::MemoryRecall,
+                ToolId::CheckpointRestore,
             ],
         );
         allowlists.insert(
@@ -866,6 +895,7 @@ impl ToolRegistry {
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
                 ToolId::MemoryRecall,
+                ToolId::CheckpointRestore,
             ],
         );
         allowlists.insert(
@@ -895,6 +925,7 @@ impl ToolRegistry {
                 ToolId::HarnessDiagnose,
                 ToolId::RepoSearch,
                 ToolId::MemoryRecall,
+                ToolId::CheckpointRestore,
             ],
         );
         allowlists.insert(

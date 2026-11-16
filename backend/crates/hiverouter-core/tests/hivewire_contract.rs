@@ -63,7 +63,9 @@ fn task_frame(session_id: &str, sequence: u64, message_id: &str, task_id: &str) 
 fn session_count(database: &Database) -> i64 {
     database
         .with_connection(|connection| {
-            connection.query_row("SELECT COUNT(*) FROM hivewire_sessions", [], |row| row.get(0))
+            connection.query_row("SELECT COUNT(*) FROM hivewire_sessions", [], |row| {
+                row.get(0)
+            })
         })
         .expect("count")
 }
@@ -79,7 +81,11 @@ fn handshake_rejects_a_bad_token_by_name_and_creates_no_session() {
         .expect_err("a bad bearer token must be refused");
     assert_eq!(error.code(), "E_HIVEWIRE_TOKEN_INVALID");
     assert!(!error.how_to_fix().is_empty());
-    assert_eq!(session_count(&database), 0, "refused handshake must not create a session");
+    assert_eq!(
+        session_count(&database),
+        0,
+        "refused handshake must not create a session"
+    );
     assert!(store.queue_depth().expect("depth") == 0);
 
     let ack = store.handshake(&request, TOKEN).expect("valid token");
@@ -102,7 +108,9 @@ fn handshake_refuses_a_weak_token_configuration() {
 fn duplicate_message_is_deduped_and_never_queued_twice() {
     let (_temp, database) = database();
     let store = HiveWireStore::open(database.clone(), config()).expect("store");
-    let ack = store.handshake(&hello("hello-1"), TOKEN).expect("handshake");
+    let ack = store
+        .handshake(&hello("hello-1"), TOKEN)
+        .expect("handshake");
 
     let frame = task_frame(&ack.session_id, ack.next_sequence, "msg-1", "task-1");
     assert_eq!(
@@ -156,8 +164,10 @@ fn a_network_endpoint_is_refused_instead_of_silently_succeeding() {
 #[test]
 fn envelope_is_versioned_and_validated() {
     let (_temp, database) = database();
-    let store = HiveWireStore::open(database, config()).expect("store");
-    let ack = store.handshake(&hello("hello-1"), TOKEN).expect("handshake");
+    let store = HiveWireStore::open(database.clone(), config()).expect("store");
+    let ack = store
+        .handshake(&hello("hello-1"), TOKEN)
+        .expect("handshake");
 
     let queued = task_frame(&ack.session_id, ack.next_sequence, "msg-1", "task-1");
     assert_eq!(
@@ -190,13 +200,44 @@ fn envelope_is_versioned_and_validated() {
         "hello must not carry a session id"
     );
 
-    // A result for the queued task settles it exactly once.
+    // A result without a live lease is refused by name and changes nothing.
+    let unleased = WireEnvelope::post_handshake(
+        &ack.session_id,
+        2,
+        "msg-result-unleased",
+        MessageBody::Result(hivewire::TaskResult {
+            task_id: "task-1".to_owned(),
+            lease: hivewire::LeaseIdentity {
+                message_id: "msg-1".to_owned(),
+                attempt: 1,
+                daemon_id: "daemon-contract".to_owned(),
+            },
+            ok: true,
+            output: serde_json::json!({"done": true}),
+        }),
+    );
+    assert_eq!(
+        store.accept(&unleased).expect_err("no lease").code(),
+        "E_HIVEWIRE_LEASE_LOST"
+    );
+    assert_eq!(
+        store.message_state("msg-1").expect("state"),
+        Some(MessageState::Queued)
+    );
+
+    // Lease it through the scheduler, then the same task settles exactly once.
+    let scheduler = hivewire::DaemonScheduler::new(database, 5_000, 3, 4)
+        .expect("scheduler")
+        .with_generation("gen-contract");
+    let tick = scheduler.tick("daemon-contract").expect("tick");
+    let leased = &tick.leased[0];
     let result = WireEnvelope::post_handshake(
         &ack.session_id,
         2,
         "msg-result-1",
         MessageBody::Result(hivewire::TaskResult {
             task_id: "task-1".to_owned(),
+            lease: leased.lease_identity(),
             ok: true,
             output: serde_json::json!({"done": true}),
         }),
@@ -215,7 +256,9 @@ fn envelope_is_versioned_and_validated() {
 fn expired_session_is_refused_after_close() {
     let (_temp, database) = database();
     let store = HiveWireStore::open(database.clone(), config()).expect("store");
-    let ack = store.handshake(&hello("hello-1"), TOKEN).expect("handshake");
+    let ack = store
+        .handshake(&hello("hello-1"), TOKEN)
+        .expect("handshake");
     database
         .with_connection(|connection| {
             connection.execute(
@@ -229,4 +272,136 @@ fn expired_session_is_refused_after_close() {
         store.accept(&frame).expect_err("closed session").code(),
         "E_HIVEWIRE_SESSION_UNKNOWN"
     );
+}
+
+#[test]
+fn loopback_ws_endpoint_is_accepted_and_tls_or_remote_hosts_are_refused() {
+    let loopback = HiveWireConfig::loopback_ws(REMOTE, 0, TOKEN);
+    loopback
+        .validate()
+        .expect("loopback ws endpoint is supported");
+    assert!(loopback
+        .endpoint
+        .as_deref()
+        .expect("endpoint")
+        .starts_with("ws://127.0.0.1:"));
+
+    for endpoint in [
+        "wss://127.0.0.1:9999/api/hivewire/ws",
+        "https://127.0.0.1:9999/api/hivewire/ws",
+        "ws://10.0.0.5:9999/api/hivewire/ws",
+        "ws://evil.example/api/hivewire/ws",
+        "inproc://",
+    ] {
+        let config = HiveWireConfig::new(REMOTE, endpoint, TOKEN);
+        let error = config.validate().expect_err(endpoint);
+        assert_eq!(
+            error.code(),
+            "E_HIVEWIRE_TRANSPORT_UNSUPPORTED",
+            "endpoint {endpoint} must be refused by name"
+        );
+    }
+}
+
+#[test]
+fn launch_token_is_stored_only_as_a_sha256_digest() {
+    let (_temp, database) = database();
+    let store = HiveWireStore::open(database.clone(), config()).expect("store");
+    assert_eq!(
+        store.token_digest_hex().len(),
+        64,
+        "a SHA-256 digest is 64 hex characters"
+    );
+    assert_ne!(store.token_digest_hex(), TOKEN);
+    store
+        .authenticate_token(TOKEN)
+        .expect("the configured token authenticates");
+    assert_eq!(
+        store
+            .authenticate_token("wrong-launch-token-000000000")
+            .expect_err("wrong token")
+            .code(),
+        "E_HIVEWIRE_TOKEN_INVALID"
+    );
+
+    store
+        .handshake(&hello("hello-digest"), TOKEN)
+        .expect("handshake");
+    let stored: String = database
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT token_sha256 FROM hivewire_sessions LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .expect("stored digest");
+    assert_eq!(stored, store.token_digest_hex());
+    assert_ne!(stored, TOKEN, "the plaintext token is never stored");
+}
+
+#[test]
+fn migration_v33_schema_is_idempotent_and_reversible() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database = Database::open(&temp.path().join("schema33.db")).expect("open");
+    database.migrate().expect("migrate");
+
+    // The frozen migration body and the runtime helper are both idempotent.
+    for _ in 0..2 {
+        database
+            .with_connection(|connection| {
+                connection.execute_batch(hivewire::SCHEMA_V33)?;
+                Ok(())
+            })
+            .expect("apply v33");
+        hivewire::ensure_schema(&database).expect("ensure schema");
+    }
+
+    let columns: Vec<String> = database
+        .with_connection(|connection| {
+            let mut statement = connection.prepare("PRAGMA table_info(hivewire_messages)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut names = Vec::new();
+            for row in rows {
+                names.push(row?);
+            }
+            Ok(names)
+        })
+        .expect("table columns");
+    for required in [
+        "remote_id",
+        "message_id",
+        "attempts",
+        "lease_owner",
+        "lease_generation",
+        "completed_at_ms",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == required),
+            "hivewire_messages must have {required}: {columns:?}"
+        );
+    }
+
+    // The inverse drops only the HiveWire tables.
+    database
+        .with_connection(|connection| {
+            connection.execute_batch(hivewire::SCHEMA_V33_DOWN)?;
+            Ok(())
+        })
+        .expect("down migration");
+    let tables: i64 = database
+        .with_connection(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'hivewire_%'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .expect("table count");
+    assert_eq!(tables, 0, "the down migration removes every HiveWire table");
+
+    // A later boot recreates the schema (runtime DDL stays idempotent).
+    hivewire::ensure_schema(&database).expect("recreate after down");
+    let reopened = HiveWireStore::open(Arc::new(database), config()).expect("store after recreate");
+    assert_eq!(reopened.queue_depth().expect("depth"), 0);
 }

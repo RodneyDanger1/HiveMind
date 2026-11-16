@@ -69,44 +69,49 @@
 //!
 //! 3. Both constructors — `RunEngine::new` (`execution.rs:1054-1098`) and
 //!    `RunEngine::with_services` (`execution.rs:1346-1393`) — initialize the
-//!    field:
+//!    field with the process-lifetime bus so unit tests need no filesystem:
 //!    ```ignore
 //!    chat: Arc::new(crate::chat_bus::ChatBus::in_memory()),
 //!    ```
-//!    The production boot path (`main.rs`/`daemon.rs`) opens the durable
-//!    variant instead so a process restart keeps acknowledged messages:
+//!    The production boot path (`http.rs::build_engine`,
+//!    `http.rs:360-447`, which owns `config.data_dir`) replaces it with the
+//!    durable journal before the engine is put in `AppState`:
 //!    ```ignore
-//!    let chat = Arc::new(crate::chat_bus::ChatBus::open_file(
-//!        data_dir.join("chat_bus.jsonl"),
-//!    )?);
-//!    engine = engine.with_chat_bus(chat);
+//!    let chat = ChatBus::open_file(&config.data_dir)?; // -> data_dir/chat_bus.jsonl
+//!    let engine = engine.with_chat_bus(Arc::new(chat));
 //!    ```
-//!    with the obvious builder
+//!    `build_engine` returns `Arc<RunEngine>` rather than `Result`, so the boot
+//!    path must surface an open refusal instead of falling back to memory: pass
+//!    the `Result` out of `build_engine` or record the refusal as a required
+//!    failed check and refuse new runs while the journal is unavailable. A
+//!    silent fallback would make acknowledged messages disappear on restart.
+//!    with the builder
 //!    `pub fn with_chat_bus(mut self, chat: Arc<ChatBus>) -> Self { self.chat = chat; self }`
 //!    on `RunEngine`.
 //!
-//! 4. Root tree creation — `RunEngine::dispatch`, after the root task row and
-//!    graph node exist (`execution.rs:2331-2346`, immediately after
-//!    `self.graph.add_task(root.id, None)?;`):
+//! 4. Root tree creation — `RunEngine::dispatch_inner`, immediately after
+//!    `self.graph.add_task(root.id, None)?;` (`execution.rs:2376`):
 //!    ```ignore
 //!    self.chat.open_tree(run.id, root.id)?;
 //!    ```
 //!    `open_tree` is idempotent, so a retried dispatch does not append twice.
+//!    It must be the first `open_tree` for the run: the first tree opened is the
+//!    run's root observer for every other tree in that run.
 //!
-//! 5. Child membership — `RunEngine::spawn_sub_hive`, after the graph node is
-//!    linked (`execution.rs:1991-1999`, immediately after
-//!    `self.graph.set_metadata(...)` and before `self.seed_task_context(...)`):
+//! 5. Child membership — `RunEngine::spawn_sub_hive`, after the graph metadata
+//!    write and before `seed_task_context` (`execution.rs:2024-2034`):
 //!    ```ignore
 //!    let tree = self.chat.tree_key_for(task.run_id)?;
 //!    self.chat
 //!        .join_tree(tree.run_id, tree.tree_id, task.id, parent_task_id)?;
 //!    ```
-//!    The same two lines go in the template-task insertion loop after each
-//!    `self.store.insert_task(&record)?` (`execution.rs:2436`).
+//!    The same two lines go after each planned-node insert
+//!    (`execution.rs:2469-2477`) and after each template-insert branch/task
+//!    (`ws.rs:345-380`). `join_tree` is idempotent for the same parent.
 //!
-//! 6. Reading a task's chat — `RunEngine::seed_task_context`, next to the A2A
-//!    inbox block (`execution.rs:1701-1717`), so chat messages are model-visible
-//!    facts under a distinct `chat:` prefix (never instructions):
+//! 6. Reading a task's chat — `RunEngine::seed_task_context`, immediately after
+//!    the A2A inbox block (`execution.rs:1701-1717`), so chat messages are
+//!    model-visible facts under a distinct `chat:` prefix (never instructions):
 //!    ```ignore
 //!    if let Ok(tree) = self.chat.tree_key_for(task.run_id) {
 //!        if let Ok(messages) = self.chat.inbox(task.run_id, tree.tree_id, task.id, 8) {
@@ -124,14 +129,14 @@
 //!        }
 //!    }
 //!    ```
-//!    `refresh_a2a_inbox` (`execution.rs:4910-4940`) and
-//!    `a2a_updates_for_task` (`execution.rs:4878-4908`) append the same facts so
-//!    a long-running task sees chat that arrived after its context was seeded.
+//!    `refresh_a2a_inbox` (`execution.rs:5048`) and `a2a_updates_for_task`
+//!    (`execution.rs:5014`) append the same facts so a long-running task sees
+//!    chat that arrived after its context was seeded.
 //!
-//! 7. Writing chat — every existing `store.record_agent_message(...)` call site
-//!    (`execution.rs:4370-4440` for sibling/parent messages, the evolution vote
-//!    path) gains a `chat.post(...)` call keyed by the durable message id so a
-//!    retry is single-effect:
+//! 7. Writing chat — every existing `store.record_agent_message*` call site
+//!    (`execution.rs:2077`, `:4506/:4523/:4566`, `:4792`, `:5786`) gains a
+//!    `chat.post(...)` call keyed by the durable message id so a retry is
+//!    single-effect:
 //!    ```ignore
 //!    self.chat.post(PostRequest {
 //!        run_id: task.run_id,
@@ -147,12 +152,13 @@
 //!    A `Result`/`Status` posted when a task reaches a terminal state uses
 //!    `to_task_id: tree.tree_id` and `visibility: Visibility::RootObserver`.
 //!
-//! 8. Root audit/observer surface — the UI read path (`http.rs` history/status
-//!    handlers) calls
-//!    `chat.observe_tree(run_id, tree_id, run_root_task_id, limit)`; WS replay
-//!    (`ws.rs:712-744`) can publish the same rows as `AGENT_MESSAGE` frames.
-//!    Neither surface may read a tree whose observer is not the tree root or the
-//!    run root: the bus refuses with `E_TOOL_NOT_ALLOWED`.
+//! 8. Root audit/observer surface — add a run-scoped read handler next to
+//!    `agent_messages` (`http.rs:2361`), resolve the run's depth-0 task as the
+//!    run root, and call
+//!    `chat.observe_tree(run_id, tree_id, run_root_task_id, limit)`. WS replay
+//!    can publish the same rows as `AGENT_MESSAGE` frames. Neither surface may
+//!    read a tree whose observer is not the tree root or the run root: the bus
+//!    refuses with `E_TOOL_NOT_ALLOWED`.
 //!
 //! ## Invariants pinned by `tests/chat_bus_contract.rs`
 //!
@@ -194,6 +200,9 @@ pub const MAX_IDEMPOTENCY_KEY_CHARS: usize = 128;
 /// Hard upper bound on rows returned by [`ChatBus::inbox`] and
 /// [`ChatBus::observe_tree`].
 pub const MAX_INBOX_LIMIT: usize = 64;
+
+/// Journal file created inside a data directory by [`ChatBus::open_file`].
+pub const JOURNAL_FILE_NAME: &str = "chat_bus.jsonl";
 
 /// Message kind. The wire form is the `snake_case` string, matching the
 /// existing A2A `kind` field convention.
@@ -243,7 +252,11 @@ impl ChatKind {
 
     /// Parses the stable wire string. An unknown string is `None` — it is never
     /// guessed into a kind.
+    ///
+    /// This is deliberately not `std::str::FromStr`: parsing is total and
+    /// returns `None` for unknown text rather than an error payload.
     #[must_use]
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "brief" => Some(ChatKind::Brief),
@@ -523,6 +536,12 @@ impl FileJournal {
             file: Mutex::new(file),
         })
     }
+
+    /// Exact file this journal appends to.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl ChatJournal for FileJournal {
@@ -547,8 +566,12 @@ impl ChatJournal for FileJournal {
         let mut records = Vec::new();
         for line in text.lines() {
             let line = line.trim();
+            // This writer never emits a blank line. An empty line in the
+            // middle of a journal is damage (interrupted rewrite, manual edit,
+            // truncation), so replay refuses the file instead of skipping it
+            // and silently losing the boundary between records.
             if line.is_empty() {
-                continue;
+                return Err(Refusal::SnapshotCorrupt);
             }
             let record: ChatJournalRecord =
                 serde_json::from_str(line).map_err(|_| Refusal::SnapshotCorrupt)?;
@@ -624,13 +647,48 @@ impl ChatBus {
         }
     }
 
-    /// Opens a durable bus over a JSONL journal. A missing file is an empty
-    /// journal; an existing file is replayed before any new post is accepted.
+    /// Opens a durable bus over the JSONL journal for a data directory.
+    ///
+    /// The argument is the directory the server already owns (the same
+    /// `config.data_dir` used for SQLite and snapshots):
+    ///
+    /// ```ignore
+    /// let bus = ChatBus::open_file(&config.data_dir)?;
+    /// // appends to <data_dir>/chat_bus.jsonl
+    /// ```
+    ///
+    /// For compatibility with path-oriented callers, an argument that already
+    /// names an existing file, or a not-yet-created path ending in `.jsonl`,
+    /// is used as the journal file itself instead of being joined with
+    /// [`JOURNAL_FILE_NAME`]. Use [`ChatBus::open_journal_file`] for any other
+    /// exact file name.
+    ///
+    /// A missing file is an empty journal; an existing file is replayed before
+    /// any new post is accepted.
     ///
     /// # Errors
     /// `E_INTERNAL_ERROR` for an unopenable path; `E_SNAPSHOT_CORRUPT` for an
-    /// unreadable record.
-    pub fn open_file(path: impl AsRef<Path>) -> Result<Self, Refusal> {
+    /// unreadable or torn record.
+    pub fn open_file(path_or_data_dir: impl AsRef<Path>) -> Result<Self, Refusal> {
+        let path = path_or_data_dir.as_ref();
+        let is_existing_file = path.is_file();
+        let ends_in_jsonl = path
+            .extension()
+            .is_some_and(|extension| extension == std::ffi::OsStr::new("jsonl"));
+        let journal_path = if path.is_dir() || (!is_existing_file && !ends_in_jsonl) {
+            path.join(JOURNAL_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        };
+        Self::open_journal_file(journal_path)
+    }
+
+    /// Opens a durable bus over an exact JSONL journal path.
+    ///
+    /// # Errors
+    /// `E_INTERNAL_ERROR` for an unopenable path; `E_SNAPSHOT_CORRUPT` for an
+    /// unreadable or torn record.
+    pub fn open_journal_file(path: impl AsRef<Path>) -> Result<Self, Refusal> {
         Self::open(Arc::new(FileJournal::open(path)?))
     }
 

@@ -43,6 +43,7 @@ pub const PROMPT_CLAIMED_TOOL_IDS: &[&str] = &[
     "harness_diagnose",
     "repo_search",
     "memory_recall",
+    "checkpoint_restore",
 ];
 
 /// Every advertised tool must have a declared execution lane. The census below
@@ -74,6 +75,9 @@ pub const EXECUTOR_DISPOSITIONS: &[(&str, &str)] = &[
     ("harness_diagnose", "read_executor"),
     ("repo_search", "read_executor"),
     ("memory_recall", "read_executor"),
+    // Undo writes through the same single-use approval lane as the mutation it
+    // reverses; it is never a read and never loop-owned.
+    ("checkpoint_restore", "approval_executor"),
 ];
 
 /// Schema id of the census payload.
@@ -257,11 +261,55 @@ mod tests {
         assert!(census.refusal_count >= 40, "the frozen table is complete");
         assert_eq!(census.tier_count, 5);
         assert_eq!(census.permission_class_count, 5);
-        assert_eq!(census.grant_count(), 16 + 25 + 24 + 14 + 14);
+        // Pinned totals (grant counts are derived; the pins make a silent grant
+        // move fail here rather than only at the endpoint).
+        assert_eq!(census.grant_count(), 17 + 26 + 25 + 14 + 14);
+        assert_eq!(
+            census
+                .tools_by_tier
+                .get("hyper_agent")
+                .map(Vec::len),
+            Some(17)
+        );
+        assert_eq!(
+            census
+                .tools_by_tier
+                .get("super_agent")
+                .map(Vec::len),
+            Some(26)
+        );
+        assert_eq!(
+            census
+                .tools_by_tier
+                .get("worker_agent")
+                .map(Vec::len),
+            Some(25)
+        );
+        assert_eq!(
+            census
+                .tools_by_tier
+                .get("subagent")
+                .map(Vec::len),
+            Some(14)
+        );
+        assert_eq!(
+            census
+                .tools_by_tier
+                .get("tool_agent")
+                .map(Vec::len),
+            Some(14)
+        );
         assert!(census.tools_by_tier.contains_key("hyper_agent"));
         assert_eq!(census.executor_dispositions.len(), census.registry_tool_ids.len());
         assert_eq!(
             census.executor_dispositions.get("file_write").map(String::as_str),
+            Some("approval_executor")
+        );
+        assert_eq!(
+            census
+                .executor_dispositions
+                .get("checkpoint_restore")
+                .map(String::as_str),
             Some("approval_executor")
         );
     }

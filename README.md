@@ -1,49 +1,97 @@
-# HiveMind — local, approval-gated HMAS prototype
+# HiveMind
 
-**Short description:** A local, single-provider, hierarchical multi-agent prototype for Windows.
-It plans bounded runs, delegates to SuperAgents/Agents/Subagents, gates side effects behind operator
-approval, persists evidence in SQLite, and refuses live work when no DeepSeek key is configured.
-It is **not AGI**, not a self-modifying agent, and not yet a general coding harness.
+**A local, approval-gated hierarchical multi-agent workspace for Windows.**
+One HyperAgent plans; SuperAgents own branches; workers execute; every side effect is explicit, every run is recorded.
 
-**Working tree:** `1.2.0-dev` (unreleased). **Sealed release:** `1.1.0` — the sealed
-version remains the release authority; the working tree is pre-release and unsealed.
+HiveMind is built for people who want to see and govern an agent system, not rent a black box. It runs on your machine, uses a single provider key, stores its ledger in SQLite, and refuses by name when a capability is unavailable instead of pretending to succeed.
 
-**Truth baseline (observed 2026-11-12, integration branch):** capability work is
-on `integration/capability-absorb`; schema is **v32** (sessions/policy, repo index,
-checkpoints, jobs, executed eval, evidence-gated lessons, eval suites/metrics); the registry has **25 tools / 93 grants / 80 named refusals**;
-`/health` is `ok` on a configured profile; docs truth checker **19/19 PASS**; the
-full backend workspace gate and the full web gate pass. This is **pre-release**
-work, not a clean release seal; the sealed `1.1.0` remains the release authority.
+![HiveMind splash — versioned startup](docs/evidence/screenshots/hivemind-splash.png)
 
-**Recent verified fixes (2026-11-13):** workspace reads are no longer denied when
-the workspace lives inside the data root; `harness_diagnose` is a real
-read-only agent tool with health/log/workspace scopes; blocked child reports are
-persisted as failed instead of completed; pending approvals for terminal runs are
-filtered out; expired approvals can be dismissed locally; the root HyperAgent
-reads only its direct managers' compressed results; and every planned seat now
-receives its own objective instead of the whole run prompt. Evidence:
-`docs/evidence/delegation-audit-20261113-163346.md` and
-`docs/research/HIERARCHICAL-DELEGATION.md`.
+![HiveMind workspace — HyperAgent, managers, workers, and the chat dock](docs/evidence/screenshots/hivemind-current.png)
 
-Read the full evidence and boundary before relying on any claim:
-[truth report](docs/audit/HIVEMIND-TRUTH-AND-ROADMAP-2026-11-10.md),
-[plan-status crosswalk](docs/plans/HIVEMIND-FINISH-PLAN-v3-STATUS.md),
-[100 use cases and 100 cannots](docs/audit/round-95/06-use-cases.md).
+<p align="center"><em>Live local build · versioned splash · full-width dock · dock-aware spatial graph</em></p>
 
-## The running app
+## Why HiveMind
 
-![HiveMind splash — versioned startup surface](docs/evidence/screenshots/hivemind-splash.png)
+- **Visible hierarchy.** A planner creates a bounded DAG; each seat gets its own plain-English objective; the HyperAgent reads managers, not raw leaf noise.
+- **Approval as a first-class object.** Shell commands, writes, patches, tests, git operations and restores are nonce-bound and auditable.
+- **Local evidence.** Runs, messages, tasks, tool turns, approvals, memory, checkpoints and usage live in one SQLite ledger.
+- **Honest refusals.** Missing key, stale approval, dirty worktree, wrong tier, budget cap, sandbox unavailable — each has a named code and a fix.
+- **No fake autonomy.** No background self-modification, no silent network remotes, no “sandboxed” claim without an OS boundary.
 
-![HiveMind desktop — completed three-branch run, live chat dock, action log](docs/evidence/screenshots/hivemind-current.png)
+## Quickstart
 
-Captured from the installed Windows build (`ad3401a`) on the live local server:
-the full-width bottom chat dock, Controls / State & settings tray, run-status chip,
-agent run list, and the completed three-SuperAgent run detail.
+### Portable build
 
-![HiveMind Help & Tutorials — first-run, dock, and safety guidance](docs/evidence/screenshots/hivemind-help.png)
+Download `release/HiveMind-1.2.0-dev-win64.zip`, extract it, and run `install-desktop.ps1`.
+The installer creates Desktop and Start Menu shortcuts; the launcher starts a loopback server, waits for `/health`, and opens the UI in a single window.
 
-![HiveMind approval card — shell_exec request with approve/deny and expiry](docs/evidence/screenshots/hivemind-approval.png)`n`n![HiveMind Data surface — workspace tree, file preview, and checkpoint restore panel](docs/evidence/screenshots/hivemind-data-fixed.png)
+### From source
 
+```powershell
+git clone https://github.com/RodneyDanger1/HiveMind.git
+cd HiveMind
+powershell -ExecutionPolicy Bypass -File tools\build-desktop.ps1
+.\dist\HiveMind\HiveMind.exe
+```
+
+Requirements: Windows 10/11, Rust stable GNU toolchain, Node.js 20+, and a DeepSeek provider key set through the local credential script. The key is never written into source or client JavaScript.
+
+## Architecture
+
+```text
+User prompt
+  └─ HyperAgent
+       ├─ planner: bounded DAG + per-seat objectives
+       ├─ control turns: create / assign / route / memory / finish
+       ├─ SuperAgent (manager): brief, verify, aggregate
+       │    └─ Agent / Subagent (worker): execute one seat
+       └─ root synthesis: manager results + tree digest + final answer
+```
+
+The UI is a spatial execution environment: the graph, hierarchy, run log, approvals, file preview, checkpoint restore panel, memory and settings share one local server. The chat dock is full-width and resizable; the graph viewport reserves its height.
+
+## Capability snapshot
+
+| Area | State |
+|---|---|
+| Hierarchical runs, per-seat objectives, manager/worker delegation | **Wired and exercised** |
+| Approvals, nonce binding, deny/expiry, audit ledger | **Wired and exercised** |
+| Workspace reads, jail, `file_read`/`fs_glob`/`fs_grep` | **Wired and exercised** |
+| `harness_diagnose`, `/api/logs`, `/diagnose` | **Wired and exercised** |
+| `repo_search` symbol index, `memory_recall` | **Wired and exercised** |
+| Cross-run session memory, `POST /api/sessions/:id/continue` | **Wired and exercised** |
+| MCP server (`hivemind_continue`, health/run/status/logs) | **Wired and exercised** |
+| Checkpoint restore UI/HTTP + `checkpoint_restore` registry/bridge | **Partial: live approved restore not yet in the gate** |
+| Chat bus, delegation protocol, HiveWire transport, embeddings, goal loop | **Library modules with tests; not wired to live runs yet** |
+| OS filesystem/network sandbox | **Not present: approval-gated arbitrary code** |
+| Network remotes / live daemon scheduler | **Fixture/in-process only** |
+| 40-node live provider proof, strict release seal | **Not claimed** |
+
+Read the full evidence and boundaries:
+[delegation audit](docs/evidence/delegation-audit-20261113-163346.md),
+[hierarchy research](docs/research/HIERARCHICAL-DELEGATION.md),
+[final state](docs/evidence/final-state-20261114.md),
+[startup plan](docs/plans/HIVEMIND-FINISH-PLAN-v3-STATUS.md).
+
+## Safety model
+
+Approval is not a sandbox. `shell_exec` runs with the server user’s privileges inside a workspace jail and a Windows Job Object; it is not filesystem- or network-isolated. A sandbox UI status that says “isolated” would be false until AppContainer or an equivalent boundary lands. The same rule applies to autonomy: agents may propose patches, but an operator must approve, checkpoint and commit them.
+
+## Verification
+
+The current tree is gated by:
+
+- `cargo test --workspace --locked`
+- `web`: `tsc --noEmit` and the full Vitest suite
+- `tools/hivemind-mcp`: stdio smoke test
+- installed-build `/health`, one-window launch, and live capability trials
+
+Screenshots and receipts live under `docs/evidence/`. A claim is only as strong as its artifact; `docs/evidence/final-state-20261114.md` records the last audited state.
+
+## Project status
+
+HiveMind is **pre-release**. The working tree is `1.2.0-dev`; the sealed `1.1.0` remains the release authority. The remaining roadmap is explicit in the capability table: live chat-bus/delegation wiring, HiveWire transport, real OS isolation, embeddings/goal loop exposure, and the 40-node sealed release proof.
 ## Capability status (wired vs library-only)
 
 These are the current boundaries, not a feature wish-list:

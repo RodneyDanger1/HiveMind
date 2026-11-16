@@ -15,57 +15,107 @@ use super::{
     MessageBody, WireEnvelope,
 };
 
-/// Creates the additive HiveWire tables. Idempotent; safe on every open.
+/// Frozen DDL for schema migration v33.
 ///
-/// This is a runtime DDL rather than a row in [`crate::db::MIGRATIONS`] because
-/// `db.rs` is outside this change's write scope. The tables are new and no
-/// existing table is altered.
+/// The `db.rs` owner appends
+/// `Migration { version: 33, name: "hivewire", up: SCHEMA_V33, down: SCHEMA_V33_DOWN }`.
+/// Every statement is `IF NOT EXISTS`, so applying it after
+/// [`ensure_schema`] (or twice) is a no-op. `lease_generation` is part of the
+/// fresh definition; [`ensure_schema`] adds it to a table created by an older
+/// runtime DDL with a guarded `ALTER TABLE`.
+pub const SCHEMA_V33: &str = "
+    CREATE TABLE IF NOT EXISTS hivewire_sessions (
+        session_id TEXT PRIMARY KEY,
+        remote_id TEXT NOT NULL,
+        protocol TEXT NOT NULL,
+        token_sha256 TEXT NOT NULL,
+        last_seen_sequence INTEGER NOT NULL,
+        last_heartbeat_ms INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        closed_at_ms INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS hivewire_messages (
+        remote_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        task_id TEXT,
+        body_json TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        queued_at_ms INTEGER NOT NULL,
+        lease_until_ms INTEGER,
+        lease_owner TEXT,
+        lease_generation TEXT,
+        completed_at_ms INTEGER,
+        PRIMARY KEY (remote_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS hivewire_messages_ready
+        ON hivewire_messages(state);
+    CREATE INDEX IF NOT EXISTS hivewire_messages_task
+        ON hivewire_messages(remote_id, task_id);
+    CREATE INDEX IF NOT EXISTS hivewire_sessions_remote
+        ON hivewire_sessions(remote_id);
+";
+
+/// Inverse of [`SCHEMA_V33`]. Only the tables this migration owns are dropped,
+/// in reverse dependency order (the indexes fall with their tables).
+pub const SCHEMA_V33_DOWN: &str = "
+    DROP INDEX IF EXISTS hivewire_messages_ready;
+    DROP INDEX IF EXISTS hivewire_messages_task;
+    DROP INDEX IF EXISTS hivewire_sessions_remote;
+    DROP TABLE IF EXISTS hivewire_messages;
+    DROP TABLE IF EXISTS hivewire_sessions;
+";
+
+/// Columns added after the first runtime DDL shipped. Each entry is applied
+/// only when the column is absent, so an existing database upgrades in place.
+const ADDITIVE_COLUMNS: &[(&str, &str, &str)] =
+    &[("hivewire_messages", "lease_generation", "TEXT")];
+
+/// Creates or upgrades the HiveWire tables. Idempotent; safe on every open.
+///
+/// This is a runtime DDL as well as the body of migration v33 because a boot
+/// path (and a test) may open a database that predates the ordered migration.
+/// The tables are new and no existing table is altered.
 ///
 /// # Errors
 /// [`HiveWireError::Store`] when the DDL fails.
 pub fn ensure_schema(db: &Database) -> Result<(), HiveWireError> {
     db.with_connection(|connection| {
-        connection.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS hivewire_sessions (
-                session_id TEXT PRIMARY KEY,
-                remote_id TEXT NOT NULL,
-                protocol TEXT NOT NULL,
-                token_sha256 TEXT NOT NULL,
-                last_seen_sequence INTEGER NOT NULL,
-                last_heartbeat_ms INTEGER NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                closed_at_ms INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS hivewire_messages (
-                remote_id TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                sequence INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                task_id TEXT,
-                body_json TEXT NOT NULL,
-                state TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                queued_at_ms INTEGER NOT NULL,
-                lease_until_ms INTEGER,
-                lease_owner TEXT,
-                completed_at_ms INTEGER,
-                PRIMARY KEY (remote_id, message_id)
-            );
-            CREATE INDEX IF NOT EXISTS hivewire_messages_ready
-                ON hivewire_messages(state);
-            CREATE INDEX IF NOT EXISTS hivewire_messages_task
-                ON hivewire_messages(remote_id, task_id);
-            CREATE INDEX IF NOT EXISTS hivewire_sessions_remote
-                ON hivewire_sessions(remote_id);
-            ",
-        )?;
+        connection.execute_batch(SCHEMA_V33)?;
+        for (table, column, declaration) in ADDITIVE_COLUMNS {
+            ensure_column(connection, table, column, declaration)?;
+        }
         Ok(())
     })
     .map_err(|error| HiveWireError::Store {
         detail: error.to_string(),
     })
+}
+
+/// Adds `column` to `table` when it is absent.
+///
+/// Table/column/declaration values come from the compile-time
+/// [`ADDITIVE_COLUMNS`] table, never from input.
+fn ensure_column(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing: String = row.get(1)?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+    connection.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+    ))
 }
 
 /// Acknowledgement returned by a successful handshake.
@@ -194,6 +244,29 @@ impl HiveWireStore {
         &self.config.remote_id
     }
 
+    /// The stored SHA-256 digest of the launch token (never the plaintext).
+    ///
+    /// This is the exact value persisted in `hivewire_sessions.token_sha256`.
+    #[must_use]
+    pub fn token_digest_hex(&self) -> &str {
+        &self.token_sha256
+    }
+
+    /// Constant-time check of a presented bearer launch token against the
+    /// stored SHA-256 digest.
+    ///
+    /// # Errors
+    /// [`HiveWireError::TokenRejected`] when the token does not match.
+    pub fn authenticate_token(&self, presented: &str) -> Result<(), HiveWireError> {
+        if token_matches(&self.token_sha256, presented) {
+            Ok(())
+        } else {
+            Err(HiveWireError::TokenRejected {
+                remote_id: self.config.remote_id.clone(),
+            })
+        }
+    }
+
     /// The database handle (used to construct a [`super::DaemonScheduler`] on the
     /// same durable queue).
     #[must_use]
@@ -255,7 +328,10 @@ impl HiveWireStore {
                 ],
             )
             .map_err(store_error)?;
-            Ok((server_last_sequence, hello.last_seen_sequence > server_last_sequence))
+            Ok((
+                server_last_sequence,
+                hello.last_seen_sequence > server_last_sequence,
+            ))
         })?;
         Ok(HandshakeAck {
             session_id,
@@ -273,9 +349,16 @@ impl HiveWireStore {
     /// enforced per session, the bounded queue is checked inside the same
     /// transaction, and the row is persisted before any success is returned.
     ///
+    /// A `result`/`error` settles exactly the lease named by its
+    /// [`super::LeaseIdentity`]: the row must still be `leased`, by that daemon,
+    /// on that attempt, and the lease must not have expired. Anything else is
+    /// [`HiveWireError::LeaseLost`] and no effect is persisted, so a late
+    /// completion can never overwrite work another daemon now owns.
+    ///
     /// # Errors
     /// [`HiveWireError::SessionUnknown`], [`HiveWireError::SequenceGap`],
-    /// [`HiveWireError::QueueFull`], plus frame and store errors.
+    /// [`HiveWireError::QueueFull`], [`HiveWireError::LeaseLost`], plus frame
+    /// and store errors.
     pub fn accept(&self, envelope: &WireEnvelope) -> Result<AcceptOutcome, HiveWireError> {
         let (session_id, sequence) = envelope.validate_post_handshake()?;
         let session_id = session_id.to_owned();
@@ -288,11 +371,10 @@ impl HiveWireStore {
             detail: "sequence does not fit the store".to_owned(),
         })?;
         let now = now_ms();
-        let body_json = serde_json::to_string(envelope).map_err(|error| {
-            super::HiveWireError::BadFrame {
+        let body_json =
+            serde_json::to_string(envelope).map_err(|error| super::HiveWireError::BadFrame {
                 detail: format!("envelope is not encodable: {error}"),
-            }
-        })?;
+            })?;
 
         with_tx(&self.db, |tx| {
             let session: Option<i64> = tx
@@ -349,6 +431,28 @@ impl HiveWireStore {
                 }
             }
 
+            // Settle the exact lease before storing the completion frame. A
+            // refusal here rolls the transaction back, so a late result leaves
+            // no row behind and can never be mistaken for a delivered effect.
+            match &body {
+                MessageBody::Result(result) => {
+                    settle_lease(
+                        tx,
+                        &remote_id,
+                        now,
+                        &result.task_id,
+                        &result.lease,
+                        Settlement::Completed,
+                    )?;
+                }
+                MessageBody::Error(error) => {
+                    if let (Some(task_id), Some(lease)) = (&error.task_id, &error.lease) {
+                        settle_lease(tx, &remote_id, now, task_id, lease, Settlement::Failed)?;
+                    }
+                }
+                MessageBody::Heartbeat(_) | MessageBody::Hello(_) | MessageBody::Task(_) => {}
+            }
+
             let state = if matches!(body, MessageBody::Task(_)) {
                 MessageState::Queued.as_str()
             } else {
@@ -372,33 +476,6 @@ impl HiveWireStore {
             )
             .map_err(store_error)?;
 
-            match &body {
-                MessageBody::Result(result) => {
-                    tx.execute(
-                        "UPDATE hivewire_messages
-                         SET state = 'completed', completed_at_ms = ?3, lease_until_ms = NULL, lease_owner = NULL
-                         WHERE remote_id = ?1 AND task_id = ?2 AND kind = 'task'
-                           AND state IN ('queued', 'leased')",
-                        params![remote_id, result.task_id, now],
-                    )
-                    .map_err(store_error)?;
-                }
-                MessageBody::Error(error) => {
-                    if let Some(task) = &error.task_id {
-                        tx.execute(
-                            "UPDATE hivewire_messages
-                             SET state = 'failed', completed_at_ms = ?3, lease_until_ms = NULL, lease_owner = NULL
-                             WHERE remote_id = ?1 AND task_id = ?2 AND kind = 'task'
-                               AND state IN ('queued', 'leased')",
-                            params![remote_id, task, now],
-                        )
-                        .map_err(store_error)?;
-                    }
-                }
-                MessageBody::Heartbeat(_) => {}
-                MessageBody::Hello(_) | MessageBody::Task(_) => {}
-            }
-
             tx.execute(
                 "UPDATE hivewire_sessions
                  SET last_seen_sequence = ?2, last_heartbeat_ms = ?3
@@ -412,6 +489,60 @@ impl HiveWireStore {
             } else {
                 AcceptOutcome::Recorded { sequence }
             })
+        })
+    }
+
+    /// Consumes the sequence of a frame that was refused without effect.
+    ///
+    /// The transport calls this after a structurally valid frame was refused
+    /// for a live-lease or capacity reason (`E_HIVEWIRE_LEASE_LOST`,
+    /// `E_HIVEWIRE_QUEUE_FULL`). Those refusals persist nothing, but the
+    /// connection must keep moving: the sequence is advanced exactly as if the
+    /// frame had been accepted, so the next frame is `sequence + 1`.
+    ///
+    /// # Errors
+    /// [`HiveWireError::SessionUnknown`], [`HiveWireError::SequenceGap`] and
+    /// [`HiveWireError::Store`].
+    pub fn consume_sequence(&self, session_id: &str, sequence: u64) -> Result<u64, HiveWireError> {
+        let remote_id = self.config.remote_id.clone();
+        let session_id = session_id.to_owned();
+        let sequence_i64 = i64::try_from(sequence).map_err(|_| HiveWireError::BadFrame {
+            detail: "sequence does not fit the store".to_owned(),
+        })?;
+        let now = now_ms();
+        with_tx(&self.db, |tx| {
+            let session: Option<i64> = tx
+                .query_row(
+                    "SELECT last_seen_sequence FROM hivewire_sessions
+                     WHERE session_id = ?1 AND remote_id = ?2 AND closed_at_ms IS NULL",
+                    params![session_id, remote_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(store_error)?;
+            let last_seen = match session {
+                Some(last_seen) => u64::try_from(last_seen).unwrap_or(0),
+                None => {
+                    return Err(HiveWireError::SessionUnknown {
+                        session_id: session_id.clone(),
+                    });
+                }
+            };
+            let expected = last_seen.saturating_add(1);
+            if sequence != expected {
+                return Err(HiveWireError::SequenceGap {
+                    expected,
+                    presented: sequence,
+                });
+            }
+            tx.execute(
+                "UPDATE hivewire_sessions
+                 SET last_seen_sequence = ?2, last_heartbeat_ms = ?3
+                 WHERE session_id = ?1",
+                params![session_id, sequence_i64, now],
+            )
+            .map_err(store_error)?;
+            Ok(sequence.saturating_add(1))
         })
     }
 
@@ -505,4 +636,100 @@ impl HiveWireStore {
             })
             .collect()
     }
+}
+
+/// Terminal state a completion writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    Completed,
+    Failed,
+}
+
+/// Settles exactly the lease named by `identity`, or refuses with
+/// [`HiveWireError::LeaseLost`].
+///
+/// The refusal rule is deliberately strict: a completion is evidence only for
+/// the attempt that held the lease at the instant it was sent. A missing row, a
+/// settled row, a different daemon, a different attempt, or an already-expired
+/// lease all mean the sender no longer owns the work.
+fn settle_lease(
+    tx: &rusqlite::Transaction<'_>,
+    remote_id: &str,
+    now: i64,
+    task_id: &str,
+    identity: &super::LeaseIdentity,
+    settlement: Settlement,
+) -> Result<(), HiveWireError> {
+    let lease_lost = || HiveWireError::LeaseLost {
+        message_id: identity.message_id.clone(),
+        owner: identity.daemon_id.clone(),
+    };
+
+    let stored: Option<(Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT task_id, lease_until_ms FROM hivewire_messages
+             WHERE remote_id = ?1 AND message_id = ?2 AND kind = 'task'",
+            params![remote_id, identity.message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_error)?;
+    let Some((stored_task_id, lease_until_ms)) = stored else {
+        return Err(HiveWireError::BadFrame {
+            detail: format!(
+                "completion names message `{}`, which is not a queued task",
+                identity.message_id
+            ),
+        });
+    };
+    if stored_task_id.as_deref() != Some(task_id) {
+        return Err(HiveWireError::BadFrame {
+            detail: format!(
+                "completion names task `{task_id}` but message `{}` carries task `{}`",
+                identity.message_id,
+                stored_task_id.as_deref().unwrap_or("<none>")
+            ),
+        });
+    }
+    if lease_until_ms.is_none_or(|until| until <= now) {
+        // The lease expired (or was never stamped) before this completion
+        // arrived: it is a late result, whatever the DB state says.
+        return Err(lease_lost());
+    }
+
+    let sql = match settlement {
+        Settlement::Completed => {
+            "UPDATE hivewire_messages
+             SET state = 'completed', completed_at_ms = ?6,
+                 lease_until_ms = NULL, lease_owner = NULL, lease_generation = NULL
+             WHERE remote_id = ?1 AND message_id = ?2 AND kind = 'task'
+               AND state = 'leased' AND lease_owner = ?3 AND attempts = ?4
+               AND lease_until_ms = ?5"
+        }
+        Settlement::Failed => {
+            "UPDATE hivewire_messages
+             SET state = 'failed', completed_at_ms = ?6,
+                 lease_until_ms = NULL, lease_owner = NULL, lease_generation = NULL
+             WHERE remote_id = ?1 AND message_id = ?2 AND kind = 'task'
+               AND state = 'leased' AND lease_owner = ?3 AND attempts = ?4
+               AND lease_until_ms = ?5"
+        }
+    };
+    let changed = tx
+        .execute(
+            sql,
+            params![
+                remote_id,
+                identity.message_id,
+                identity.daemon_id,
+                i64::from(identity.attempt),
+                lease_until_ms,
+                now
+            ],
+        )
+        .map_err(store_error)?;
+    if changed != 1 {
+        return Err(lease_lost());
+    }
+    Ok(())
 }

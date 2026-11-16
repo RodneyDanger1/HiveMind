@@ -26,6 +26,11 @@
 //! - working directory is resolved through [`WorkspaceJail`] (the child's
 //!   initial cwd is inside the jail; the child itself is not filesystem-jailed);
 //! - stdout/stderr are capped; the child is bounded by a timeout;
+//! - every run gets a per-run sandbox environment: `TEMP`/`TMP` point at
+//!   `workspace/.sandbox-tmp/<run-id>/tmp`, `USERPROFILE`/`HOME` are removed,
+//!   the credential-scrubbing allowlist is applied, and
+//!   `workspace/.sandbox-tmp/<run-id>/work` is available as the explicit
+//!   per-run working directory ([`SandboxRun`]);
 //! - process-tree containment is acquired **before** spawn: a kill-on-close
 //!   Windows Job Object (single containment owner: win32job, never cap-std)
 //!   holds the child and every descendant, and is closed on timeout,
@@ -34,12 +39,23 @@
 //!   [`E_SANDBOX_UNAVAILABLE`] instead of running uncontained;
 //! - run cancellation returns `E_TOOL_CANCELLED` after terminating the child.
 //!
+//! # Phase D1 containment is not isolation
+//!
+//! [`sandbox`] publishes [`SandboxProfile`]/[`SandboxStatus`]: D1 provides
+//! process-tree kill + allowlist + environment scrub + per-run temp only.
+//! `filesystem_isolated` and `network_isolated` are always `false` with named
+//! reasons, and [`SandboxStatus::isolation_claim`] states the non-claim. The
+//! Lead should call [`sandbox_preflight`] before approval and pass the prepared
+//! run to [`execute_in_sandbox`].
+//!
 //! Residual limits (not fixed by this module): the Job Object controls process
 //! lifetime only — not filesystem, registry, or network access; the child runs
 //! with the server user's privileges and can read and write outside the jail;
 //! containment is assigned immediately after spawn, so a child that forks
-//! within that window before assignment is not captured; `git`/`cargo` still
-//! execute repository-controlled code (hooks, aliases, build scripts).
+//! within that window before assignment is not captured (the exact
+//! `CREATE_SUSPENDED`/`ResumeThread` blocker is documented in
+//! [`SPAWN_ASSIGNMENT_RACE_BLOCKER`]); `git`/`cargo` still execute
+//! repository-controlled code (hooks, aliases, build scripts).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -52,6 +68,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::ToolError;
 use crate::jail::WorkspaceJail;
+
+#[path = "sandbox.rs"]
+pub mod sandbox;
+pub use sandbox::{
+    sandbox_preflight, sandbox_status, SandboxError, SandboxPreflight, SandboxProfile, SandboxRun,
+    SandboxStatus, E_SANDBOX_ISOLATION_UNAVAILABLE, E_SANDBOX_RUN_ID, E_SANDBOX_TEMP,
+    SPAWN_ASSIGNMENT_RACE_BLOCKER,
+};
 
 /// Default stdout cap (1 MiB) and stderr cap (256 KiB).
 pub const DEFAULT_MAX_STDOUT_BYTES: usize = 1024 * 1024;
@@ -315,6 +339,7 @@ pub struct ShellPolicy {
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
     timeout: Duration,
+    sandbox_profile: SandboxProfile,
 }
 
 impl ShellPolicy {
@@ -342,6 +367,7 @@ impl ShellPolicy {
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
             timeout: DEFAULT_TIMEOUT,
+            sandbox_profile: SandboxProfile::d1(),
         }
     }
 
@@ -479,6 +505,23 @@ impl ShellPolicy {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// Sets the sandbox profile every run created by this policy requests.
+    ///
+    /// The default is [`SandboxProfile::d1`] (containment, no isolation). A
+    /// profile that requests an unavailable isolation is refused by
+    /// [`SandboxRun::prepare`] before any child is spawned.
+    #[must_use]
+    pub fn with_sandbox_profile(mut self, sandbox_profile: SandboxProfile) -> Self {
+        self.sandbox_profile = sandbox_profile;
+        self
+    }
+
+    /// The sandbox profile this policy requests.
+    #[must_use]
+    pub fn sandbox_profile(&self) -> SandboxProfile {
+        self.sandbox_profile
+    }
 }
 
 /// One shell request (arguments passed directly, no shell interpolation).
@@ -533,26 +576,99 @@ pub struct ShellOutput {
     pub duration_ms: u128,
 }
 
-/// Executes an allowlisted program inside the jail.
+/// Executes an allowlisted program inside the jail with a fresh per-run sandbox
+/// directory and the default workspace-root cwd.
+///
+/// The run id is generated (`UUIDv7`) and its `TEMP`/`TMP`/working directory are
+/// created and removed around the call. Callers that already ran
+/// [`sandbox_preflight`] should use [`execute_in_sandbox`] so the preflighted
+/// run id and directories are the ones executed.
 ///
 /// # Errors
 /// [`Refusal::ToolNotAllowed`] for a program outside the allowlist, a
 /// separator-bearing program string, or a per-command argument policy
 /// violation; [`Refusal::PathOutsideJail`] for an escaping working directory;
 /// [`E_SANDBOX_UNAVAILABLE`] when no OS process-tree sandbox exists (refused
-/// before spawn, never run uncontained); [`Refusal::ToolTimeout`] when the child
-/// exceeds the timeout (whole tree terminated); [`Refusal::ToolCancelled`] when
-/// the run is cancelled; [`Refusal::InternalError`] for spawn/I/O failures.
+/// before spawn, never run uncontained); `E_SANDBOX_*` inside
+/// [`Refusal::InternalError`] when the per-run directories cannot be prepared;
+/// [`Refusal::ToolTimeout`] when the child exceeds the timeout (whole tree
+/// terminated); [`Refusal::ToolCancelled`] when the run is cancelled;
+/// [`Refusal::InternalError`] for spawn/I/O failures.
 pub async fn execute(
     jail: &WorkspaceJail,
     policy: &ShellPolicy,
     request: &ShellRequest,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ShellOutput, ToolError> {
-    policy.validate_invocation(&request.program, &request.args)?;
-    let cwd: PathBuf = match &request.cwd {
+    // Validate before creating any run state so a doomed request leaves nothing.
+    validate_request(jail, policy, request)?;
+
+    // Containment is acquired BEFORE the child exists: a host that cannot
+    // provide a process-tree sandbox refuses by name instead of running the
+    // command uncontained.
+    let sandbox = acquire_process_tree_sandbox()?;
+
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let run = SandboxRun::prepare(jail, &run_id, policy.sandbox_profile())
+        .map_err(sandbox_error_to_tool)?;
+
+    let outcome =
+        execute_contained(jail, policy, request, &run, sandbox, false, cancellation).await;
+
+    // The Job Object has been dropped by `execute_contained`; the run directory
+    // is now best-effort removed. Cleanup failure never rewrites a result the
+    // child actually produced, but it is logged rather than swallowed.
+    if let Err(error) = run.cleanup() {
+        tracing::warn!(
+            run_id = %run_id,
+            %error,
+            "per-run sandbox temp cleanup failed"
+        );
+    }
+    outcome
+}
+
+/// Executes an allowlisted program with a caller-prepared [`SandboxRun`].
+///
+/// This is the preflighted path: the Lead calls [`sandbox_preflight`] before
+/// asking for approval, keeps the returned run, and hands it here after the
+/// grant. `TEMP`/`TMP` point at the run's `tmp` directory, `USERPROFILE`/`HOME`
+/// are removed, and when `request.cwd` is `None` the child starts in the run's
+/// per-run `work` directory. An explicit `request.cwd` is still resolved through
+/// [`WorkspaceJail`] (escapes are refused).
+///
+/// The Job Object is closed when this function returns, so any detached
+/// descendant still alive in the job is reaped before the caller observes the
+/// result.
+///
+/// # Errors
+/// The same pre-spawn refusals as [`execute`]; `E_SANDBOX_RUN_ID` inside
+/// [`Refusal::InternalError`] when `run` does not resolve inside `jail`; and
+/// [`E_SANDBOX_UNAVAILABLE`] when no process-tree backend exists.
+pub async fn execute_in_sandbox(
+    jail: &WorkspaceJail,
+    policy: &ShellPolicy,
+    request: &ShellRequest,
+    run: &SandboxRun,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ShellOutput, ToolError> {
+    let sandbox = acquire_process_tree_sandbox()?;
+    execute_contained(jail, policy, request, run, sandbox, true, cancellation).await
+}
+
+/// Resolves the effective cwd and rejects an explicit cwd that is not an
+/// in-jail directory.
+fn resolve_request_cwd(
+    jail: &WorkspaceJail,
+    request: &ShellRequest,
+    run_working_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, ToolError> {
+    let cwd = match &request.cwd {
         Some(cwd) => jail.resolve(cwd)?,
-        None => jail.root().to_path_buf(),
+        None => match run_working_dir {
+            Some(working_dir) => working_dir.to_path_buf(),
+            None => jail.root().to_path_buf(),
+        },
     };
     if !cwd.is_dir() {
         return Err(ToolError::new(
@@ -560,11 +676,60 @@ pub async fn execute(
             "shell working directory is not a directory inside the jail",
         ));
     }
+    Ok(cwd)
+}
 
-    // Containment is acquired BEFORE the child exists: a host that cannot
-    // provide a process-tree sandbox refuses by name instead of running the
-    // command uncontained.
-    let sandbox = acquire_process_tree_sandbox()?;
+fn validate_request(
+    jail: &WorkspaceJail,
+    policy: &ShellPolicy,
+    request: &ShellRequest,
+) -> Result<(), ToolError> {
+    policy.validate_invocation(&request.program, &request.args)?;
+    if request.cwd.is_some() {
+        resolve_request_cwd(jail, request, None)?;
+    }
+    Ok(())
+}
+
+/// Shared contained execution body. Takes ownership of the Job Object so it is
+/// closed on every return path (including a detached grandchild left behind by
+/// a normally-exiting child).
+async fn execute_contained(
+    jail: &WorkspaceJail,
+    policy: &ShellPolicy,
+    request: &ShellRequest,
+    run: &SandboxRun,
+    sandbox: ProcessTreeSandbox,
+    default_cwd_to_run_workdir: bool,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ShellOutput, ToolError> {
+    validate_request(jail, policy, request)?;
+
+    // A run prepared for a different workspace must never receive a child.
+    let canonical_run_root = std::fs::canonicalize(run.root()).map_err(|error| {
+        ToolError::new(
+            Refusal::InternalError,
+            format!(
+                "{E_SANDBOX_RUN_ID}: per-run sandbox directory {} is unavailable: {error}",
+                run.root().display()
+            ),
+        )
+    })?;
+    if !jail.is_inside(&canonical_run_root) {
+        return Err(ToolError::new(
+            Refusal::InternalError,
+            format!(
+                "{E_SANDBOX_RUN_ID}: per-run sandbox directory {} is outside the workspace jail",
+                run.root().display()
+            ),
+        ));
+    }
+
+    let cwd = resolve_request_cwd(
+        jail,
+        request,
+        default_cwd_to_run_workdir.then_some(run.working_dir()),
+    )?;
 
     let started = Instant::now();
     let mut command = Command::new(&request.program);
@@ -575,7 +740,7 @@ pub async fn execute(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    crate::env_safety::sanitize_tokio(&mut command);
+    crate::env_safety::sanitize_tokio_with_sandbox(&mut command, run.temp_dir());
 
     let mut child = command.spawn().map_err(|error| {
         ToolError::new(
@@ -657,6 +822,25 @@ pub async fn execute(
             format!("I/O failure while running {:?}: {detail}", request.program),
         )),
     }
+}
+
+/// Maps the local sandbox error code onto the frozen refusal table's existing
+/// `E_INTERNAL_ERROR` wire code (this seat may not add a sandbox variant). The
+/// local code and named reasons lead the detail so the Lead can map them at the
+/// boundary without parsing free text.
+fn sandbox_error_to_tool(error: SandboxError) -> ToolError {
+    let reason_codes = error.reason_codes();
+    let detail = if reason_codes.is_empty() {
+        format!("{}: {}", error.code(), error.detail())
+    } else {
+        format!(
+            "{}: {} [reasons: {}]",
+            error.code(),
+            error.detail(),
+            reason_codes.join(", ")
+        )
+    };
+    ToolError::new(Refusal::InternalError, detail)
 }
 
 enum Outcome {

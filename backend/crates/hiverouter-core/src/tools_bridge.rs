@@ -29,7 +29,7 @@ use hiverouter_tools::approval::{ApprovalRequest, ApprovalResolution};
 use hiverouter_tools::git::{Git, GitDiffRequest, GitLogRequest};
 use hiverouter_tools::jail::WorkspaceJail;
 use hiverouter_tools::ledger::{append_approval_decision, RunLedger, LEDGER_FILE_NAME};
-use hiverouter_tools::tool::{GitDiffArgs, GitLogArgs, GitStatusArgs};
+use hiverouter_tools::tool::{CheckpointRestoreArgs, GitDiffArgs, GitLogArgs, GitStatusArgs};
 use hiverouter_tools::ToolError;
 
 use crate::checkpoint::{CheckpointError, CheckpointJournal, FileCheckpoint};
@@ -530,6 +530,71 @@ impl ToolsBridge {
         .await
     }
 
+    /// Executes one approved `checkpoint_restore` call.
+    ///
+    /// Tier/schema and checkpoint/path checks happen before the grant CAS, so a
+    /// doomed restore does not consume the operator's approval. The actual
+    /// write is `CheckpointJournal::restore_by_id`, which re-verifies the
+    /// current after-image and the journalled before-image.
+    async fn execute_checkpoint_restore(
+        &self,
+        run_id: RunId,
+        registry: &hiverouter_tools::tool::ToolRegistry,
+        tier: hiverouter_tools::tool::AgentTier,
+        tool: &str,
+        args: &serde_json::Value,
+        binding: Option<(&str, &str)>,
+    ) -> Result<hiverouter_tools::executor::ExecutedTool, Refusal> {
+        registry
+            .resolve_call(tier, tool, args)
+            .map_err(Self::map_tool_error)?;
+        let parsed: CheckpointRestoreArgs =
+            serde_json::from_value(args.clone()).map_err(|_| Refusal::SchemaInvalid)?;
+        let Some(journal) = self.checkpoint_journal.as_ref() else {
+            return Err(Refusal::InternalError);
+        };
+        let entry = journal
+            .get_by_id(&parsed.checkpoint_id)
+            .map_err(|error| error.refusal())?;
+        let Some(entry) = entry else {
+            return Ok(hiverouter_tools::executor::ExecutedTool::Refused {
+                code: Refusal::InternalError.code().to_owned(),
+                detail: "checkpoint_restore: checkpoint id was not found for this run".to_owned(),
+            });
+        };
+        if entry.run_id != run_id {
+            return Ok(hiverouter_tools::executor::ExecutedTool::Refused {
+                code: Refusal::ToolNotAllowed.code().to_owned(),
+                detail: "checkpoint_restore: checkpoint belongs to another run".to_owned(),
+            });
+        }
+        if entry.path != parsed.path {
+            return Ok(hiverouter_tools::executor::ExecutedTool::Refused {
+                code: Refusal::SchemaInvalid.code().to_owned(),
+                detail: "checkpoint_restore: path does not match the journalled checkpoint path"
+                    .to_owned(),
+            });
+        }
+        let tool_id = hiverouter_tools::ToolId::CheckpointRestore;
+        let now_unix_secs = Timestamp::now().unix_secs().unwrap_or(0);
+        match binding {
+            Some((approval_id, tool_call_id)) => self.verify_tool_grant_bound(
+                approval_id,
+                tool_call_id,
+                run_id,
+                tool_id,
+                args,
+                now_unix_secs,
+            )?,
+            None => self.verify_tool_grant(run_id, tool_id, args, now_unix_secs)?,
+        }
+        let receipt = journal
+            .restore_by_id(&parsed.checkpoint_id, &parsed.path)
+            .map_err(|error| error.refusal())?;
+        let text = serde_json::to_string(&receipt).map_err(|_| Refusal::InternalError)?;
+        Ok(hiverouter_tools::executor::ExecutedTool::Ok { text })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_approved_with_binding(
         &self,
@@ -549,6 +614,11 @@ impl ToolsBridge {
                          the approval was not consumed"
                     .to_owned(),
             });
+        }
+        if tool == hiverouter_tools::ToolId::CheckpointRestore.id() {
+            return self
+                .execute_checkpoint_restore(run_id, registry, tier, tool, args, binding)
+                .await;
         }
         let jail = self.require_jail()?;
         let prepared = hiverouter_tools::side_effects::preflight_side_effect(

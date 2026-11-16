@@ -137,11 +137,18 @@ if (-not $NoLaunch) {
     $process = Start-Process -FilePath (Join-Path $InstallRoot 'HiveMind.exe') -WorkingDirectory $InstallRoot -PassThru
     Start-Sleep -Seconds 3
     $health = $null
-    for ($i = 0; $i -lt 20; $i++) {
-        try {
-            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:8099/health' -TimeoutSec 2
-            break
-        } catch {
+    # The launcher picks the first free port in 8099..8199; probing only 8099
+    # reports a false failure whenever that port is occupied.
+    for ($i = 0; $i -lt 20 -and $null -eq $health; $i++) {
+        foreach ($port in 8099..8199) {
+            try {
+                $health = Invoke-RestMethod -Uri ("http://127.0.0.1:$port/health") -TimeoutSec 1
+                break
+            } catch {
+                # Try the next candidate port.
+            }
+        }
+        if ($null -eq $health) {
             Start-Sleep -Milliseconds 500
         }
     }

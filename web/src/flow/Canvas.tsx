@@ -478,7 +478,7 @@ function CanvasInner() {
         </defs>
       </svg>
       <div className="hive-scan" aria-hidden="true" />
-      <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[660px] w-[620px] -translate-x-1/2 -translate-y-1/2">
+      <div className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[520px] w-[500px] -translate-x-1/2 -translate-y-1/2">
         <span className="ambient-bee ambient-bee-a" aria-hidden="true">
           <BeeMark />
         </span>
