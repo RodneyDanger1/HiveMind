@@ -68,6 +68,14 @@ The UI is a spatial execution environment: the graph, hierarchy, run log, approv
 | Network remotes / live daemon scheduler | **Fixture/in-process only** |
 | 40-node live provider proof, strict release seal | **Not claimed** |
 
+## What landed in this branch
+
+- `checkpoint_restore` is a registered, approval-gated Mutate tool with a bridge-side restore receipt; live approved-restore proof is still pending.
+- `chat_bus` and `delegation_protocol` now have production persistence, briefs, bottom-up reports, blocked semantics and per-tree digests, with live module tests.
+- HiveWire has a tested loopback WebSocket transport, lease-verified completions, idempotent v33 schema and a scheduler loop; it is not yet mounted in the server.
+- Sandbox D1 is wired into shell execution: per-run temp, env scrub, job-object tree kill, and an explicit “not filesystem/network isolated” status.
+- Embeddings (exact cosine, loopback operator endpoint) and a bounded goal loop are implemented and tested as modules; DB/HTTP/engine wiring is next.
+- Hive geometry is now a single 620×660 viewBox scaled by CSS, eliminating the clipped landing board.
 Read the full evidence and boundaries:
 [delegation audit](docs/evidence/delegation-audit-20261113-163346.md),
 [hierarchy research](docs/research/HIERARCHICAL-DELEGATION.md),
