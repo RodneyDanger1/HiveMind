@@ -83,6 +83,22 @@ foreach ($script in @(
     if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination $outDir -Force }
     else { throw "required packaged tool is missing: $source" }
 }
+# The documented MCP surface is the 7-tool stdio server in tools\hivemind-mcp.
+# Keep it in its own folder so the read-only legacy adapter and the full server
+# cannot be confused by path.
+$mcpSource = Join-Path $root 'tools\hivemind-mcp'
+if (Test-Path -LiteralPath (Join-Path $mcpSource 'server.mjs')) {
+    $mcpDest = Join-Path $outDir 'tools\hivemind-mcp'
+    New-Item -ItemType Directory -Force -Path $mcpDest | Out-Null
+    foreach ($mcpFile in @('server.mjs', 'package.json', 'README.md')) {
+        $candidate = Join-Path $mcpSource $mcpFile
+        if (Test-Path -LiteralPath $candidate) {
+            Copy-Item -LiteralPath $candidate -Destination (Join-Path $mcpDest $mcpFile) -Force
+        }
+    }
+} else {
+    throw "required packaged MCP server is missing: $mcpSource\server.mjs"
+}
 @"
 HiveMind portable desktop build
 ================================

@@ -13,7 +13,7 @@
     "display_name": "Content Writer",
     "tier": "worker",
     "template_id": "content-writer",
-    "allowed_tool_ids": ["file_read", "file_list", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
+    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },
@@ -42,7 +42,7 @@
     "display_name": "Data Analyst",
     "tier": "worker",
     "template_id": "data-analyst",
-    "allowed_tool_ids": ["file_read", "file_list", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
+    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },

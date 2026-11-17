@@ -56,6 +56,18 @@ foreach ($extra in @('set-provider-key.ps1', 'set-provider-profile.ps1', 'hivemi
         Copy-Item -LiteralPath $candidate -Destination (Join-Path $InstallRoot $extra) -Force
     }
 }
+# Ship the documented 7-tool MCP server, not only the read-only legacy adapter.
+$mcpSource = Join-Path $source 'tools\hivemind-mcp'
+if (Test-Path -LiteralPath (Join-Path $mcpSource 'server.mjs')) {
+    $mcpDest = Join-Path $InstallRoot 'tools\hivemind-mcp'
+    New-Item -ItemType Directory -Force -Path $mcpDest | Out-Null
+    foreach ($mcpFile in @('server.mjs', 'package.json', 'README.md')) {
+        $candidate = Join-Path $mcpSource $mcpFile
+        if (Test-Path -LiteralPath $candidate) {
+            Copy-Item -LiteralPath $candidate -Destination (Join-Path $mcpDest $mcpFile) -Force
+        }
+    }
+}
 
 # Shortcuts: Desktop and Start Menu, current user only.
 function New-Shortcut([string]$Path) {
