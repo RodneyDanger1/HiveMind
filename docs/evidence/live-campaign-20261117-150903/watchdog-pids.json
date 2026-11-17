@@ -1,0 +1,18 @@
+[
+    {
+        "role":  "liveness",
+        "pid":  4160
+    },
+    {
+        "role":  "wire",
+        "pid":  5320
+    },
+    {
+        "role":  "artifact",
+        "pid":  7728
+    },
+    {
+        "role":  "defect",
+        "pid":  6016
+    }
+]

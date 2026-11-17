@@ -1,0 +1,9 @@
+{
+  "role": "defect",
+  "records": 356,
+  "ledger": "C:\\Users\\Riley\\Desktop\\hiverouter-v1\\docs\\evidence\\live-campaign-20261117-150903\\ledgers\\defect.jsonl",
+  "last_hash": "28ee109b269b4231caa2c027cee3a08d5eff69462579915e8eec03ce2de91824",
+  "sealed_at": "2026-11-17T21:12:04.036Z",
+  "gaps": 0,
+  "ok": true
+}

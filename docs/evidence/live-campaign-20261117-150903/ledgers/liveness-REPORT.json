@@ -1,0 +1,7 @@
+{
+  "role": "liveness",
+  "ok": false,
+  "error": "TimeoutError: The operation was aborted due to timeout",
+  "records": 185,
+  "ledger": "C:\\Users\\Riley\\Desktop\\hiverouter-v1\\docs\\evidence\\live-campaign-20261117-150903\\ledgers\\liveness.jsonl"
+}

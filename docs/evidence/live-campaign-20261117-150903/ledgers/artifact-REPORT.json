@@ -1,0 +1,9 @@
+{
+  "role": "artifact",
+  "records": 290,
+  "ledger": "C:\\Users\\Riley\\Desktop\\hiverouter-v1\\docs\\evidence\\live-campaign-20261117-150903\\ledgers\\artifact.jsonl",
+  "last_hash": "dea246f5f7f24757a80501206be6d63e3b7929845fdd41e7dad79807faed8c9b",
+  "sealed_at": "2026-11-17T21:12:04.393Z",
+  "gaps": 0,
+  "ok": true
+}

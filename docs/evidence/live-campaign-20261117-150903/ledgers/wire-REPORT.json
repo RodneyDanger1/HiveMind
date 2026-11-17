@@ -1,0 +1,9 @@
+{
+  "role": "wire",
+  "records": 240,
+  "ledger": "C:\\Users\\Riley\\Desktop\\hiverouter-v1\\docs\\evidence\\live-campaign-20261117-150903\\ledgers\\wire.jsonl",
+  "last_hash": "ca30e1a5f314539999980f266ab272b21ab78848e1404aada881941f637e9625",
+  "sealed_at": "2026-11-17T21:12:05.003Z",
+  "gaps": 0,
+  "ok": true
+}
