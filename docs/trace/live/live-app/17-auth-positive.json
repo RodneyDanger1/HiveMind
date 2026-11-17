@@ -1,0 +1,29 @@
+{
+  "htmlStatus": 200,
+  "sessionReads": [
+    {
+      "status": 200,
+      "url": "http://127.0.0.1:8099/api/session"
+    },
+    {
+      "status": 200,
+      "url": "http://127.0.0.1:8099/api/session"
+    }
+  ],
+  "wsOpened": 1,
+  "wsUrlHasLaunchToken": false,
+  "serverHello": {
+    "name": "SERVER_HELLO",
+    "schema": "hiverouter.v1"
+  },
+  "auth": {
+    "baseURL": "http://127.0.0.1:8099",
+    "gated": true,
+    "unauthSessionStatus": 403,
+    "tokenPresent": true,
+    "tokenSource": "file:launch.token",
+    "tokenFingerprint": "c1a7cb5a6ad4",
+    "dataDirConfigured": true,
+    "dataDirSource": "LOCALAPPDATA"
+  }
+}

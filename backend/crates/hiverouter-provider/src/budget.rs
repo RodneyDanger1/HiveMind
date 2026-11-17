@@ -209,10 +209,18 @@ impl RunBudget {
         self.retries
     }
 
-    /// Spent cost in USD (Decimal only).
+    /// Honest settled cost. `None` means the spend is unknown/unpriced and must
+    /// not be rendered as a measured zero.
+    #[must_use]
+    pub fn settled_usd(&self) -> Option<Decimal> {
+        self.accounting.settled_usd().ok()
+    }
+
+    /// Legacy budget-math floor: unknown spend is treated as zero **only** for
+    /// the conservative pre-send check. Display code must use [`Self::settled_usd`].
     #[must_use]
     pub fn spent_usd(&self) -> Decimal {
-        self.accounting.settled_usd().unwrap_or(Decimal::ZERO)
+        self.settled_usd().unwrap_or(Decimal::ZERO)
     }
 
     /// Remaining run cost budget (never negative).

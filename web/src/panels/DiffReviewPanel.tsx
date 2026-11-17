@@ -16,7 +16,6 @@ import { RefusalError } from '../api/refusals';
 import type { Refusal } from '../api/contract';
 import {
   formatFileState,
-  isTerminalRunStatus,
   loadRunFileChanges,
   missingHopDetail,
   restoreCheckpoint,
@@ -34,10 +33,45 @@ export interface DiffReviewPanelProps {
   readonly loadOptions?: LoadRunFileChangesOptions;
   /** Injection seam for tests; defaults to the real restore route. */
   readonly restore?: (runId: string, seq: number) => Promise<RestoredCheckpoint>;
+  /**
+   * Called after the server confirms a restore. Must not throw: it exists so a
+   * host panel can refresh the file tree/preview it rendered before the rewind.
+   */
+  readonly onRestored?: (receipt: RestoredCheckpoint) => void;
   readonly className?: string;
 }
 
 type PanelStatus = 'idle' | 'loading' | 'ready' | 'error';
+
+export interface RestorePolicy {
+  /** Whether the checkpoint rows offer a Restore control for this run. */
+  readonly canRestore: boolean;
+  /** One-line explanation rendered in the panel note. */
+  readonly notice: string;
+}
+
+/**
+ * Restore availability for a run's checkpoint journal.
+ *
+ * Restore is a rewind, not a merge: the server verifies the current file
+ * against the recorded after-image and the journalled before-image, and
+ * refuses drift. The run lifecycle therefore does not decide whether its
+ * history is restorable — gating the control on a terminal `runStatus` hides
+ * a route that works after completion. Only "no run selected" disables it.
+ */
+export function restorePolicy(
+  runId: string | null,
+  runStatus: string | null | undefined,
+): RestorePolicy {
+  const status = runStatus === null || runStatus === undefined ? 'unknown' : runStatus;
+  return {
+    canRestore: runId !== null,
+    notice:
+      `Run status: ${status}. Restore is a rewind, not a merge: the server verifies the ` +
+      'current file and the journalled before-image, and refuses drift. A completed run\'s ' +
+      'history remains restorable.',
+  };
+}
 
 const CONTENT_MISSING = missingHopDetail('diff.content') ?? 'Diff content is unavailable.';
 const APPLY_MISSING = missingHopDetail('diff.apply') ?? 'Applying a change is unavailable.';
@@ -48,6 +82,7 @@ export function DiffReviewPanel({
   loadChanges,
   loadOptions,
   restore,
+  onRestored,
   className,
 }: DiffReviewPanelProps) {
   const [status, setStatus] = useState<PanelStatus>('idle');
@@ -64,8 +99,9 @@ export function DiffReviewPanel({
       setRestoreBusySeq(change.seq);
       setRestoreError(null);
       setRestored(null);
+      let receipt: RestoredCheckpoint | null = null;
       try {
-        const receipt = restore
+        receipt = restore
           ? await restore(runId, change.seq)
           : await restoreCheckpoint(runId, change.seq, loadOptions);
         setRestored(receipt);
@@ -84,8 +120,13 @@ export function DiffReviewPanel({
       } finally {
         setRestoreBusySeq(null);
       }
+      // Only a confirmed receipt refreshes the host: a refusal must leave the
+      // preview exactly as it was.
+      if (receipt !== null) {
+        onRestored?.(receipt);
+      }
     },
-    [runId, restore, loadOptions, restoreBusySeq],
+    [runId, restore, loadOptions, restoreBusySeq, onRestored],
   );
 
   const load = useCallback(
@@ -135,7 +176,7 @@ export function DiffReviewPanel({
   }, [runId, load, reloadKey]);
 
   const changes = data?.changes ?? [];
-  const terminal = isTerminalRunStatus(runStatus);
+  const policy = restorePolicy(runId, runStatus);
 
   return (
     <section aria-label="Run file changes" className={className}>
@@ -162,11 +203,7 @@ export function DiffReviewPanel({
           Full-file checkpoint restore is available below: the server verifies the current
           file and the journalled before-image before writing, and refuses drift.
         </p>
-        {terminal ? (
-          <p className="mt-1 opacity-80">
-            This run is terminal ({runStatus}); its journal is read-only history.
-          </p>
-        ) : null}
+        <p className="mt-1 opacity-80">{policy.notice}</p>
       </div>
 
       {status === 'idle' ? <p className="mt-3 text-sm">Select a run to review its file changes.</p> : null}
@@ -200,7 +237,7 @@ export function DiffReviewPanel({
         ) : (
           <FileChangeTable
             changes={changes}
-            canRestore={!terminal}
+            canRestore={policy.canRestore}
             onRestore={(change) => {
               void doRestore(change);
             }}
@@ -310,8 +347,10 @@ function FileChangeRow({
             >
               {busy ? 'Restoring…' : confirm ? 'Confirm restore' : 'Restore'}
             </button>
-          ) : (
+          ) : change.after === null ? (
             <span className="opacity-60">not recorded</span>
+          ) : (
+            <span className="opacity-60">restore unavailable</span>
           )}
         </td>
       ) : null}

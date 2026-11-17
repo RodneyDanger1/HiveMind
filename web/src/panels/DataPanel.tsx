@@ -16,6 +16,7 @@ import { Editor, FileTree, FILE_TREE_COPY, buildFileTreeNodes } from '../workben
 import type { FileTreeStatus } from '../workbench';
 import { PanelTitle, EmptyState, LoadingState, ErrorState } from './StatePack';
 import { DiffReviewPanel } from './DiffReviewPanel';
+import type { RestoredCheckpoint } from './workbenchContracts';
 
 const FILE_TREE_STATUS: Record<string, FileTreeStatus> = {
   idle: 'idle',
@@ -23,6 +24,24 @@ const FILE_TREE_STATUS: Record<string, FileTreeStatus> = {
   ok: 'ready',
   error: 'error',
 };
+
+/**
+ * A checkpoint restore rewinds the file on disk behind this panel's back.
+ * Refresh the listing, and re-read the preview when it was showing the
+ * restored path — otherwise the Editor would keep rendering the pre-restore
+ * bytes as if they were current.
+ */
+export function refreshAfterRestore(
+  receipt: RestoredCheckpoint,
+  selectedPath: string | null,
+  requestFileTree: () => Promise<void>,
+  openFile: (path: string) => Promise<void>,
+): void {
+  void requestFileTree();
+  if (selectedPath === receipt.path) {
+    void openFile(receipt.path);
+  }
+}
 
 export function DataPanel() {
   const fileTree = useUiStore((state) => state.fileTree);
@@ -115,7 +134,14 @@ export function DataPanel() {
           />
         ) : null}
         <div className="mt-4 border-t border-hairline pt-3">
-          <DiffReviewPanel runId={run?.id ?? null} runStatus={run?.status ?? null} />
+          <DiffReviewPanel
+            key={run?.id ?? 'no-run'}
+            runId={run?.id ?? null}
+            runStatus={run?.status ?? null}
+            onRestored={(receipt) => {
+              refreshAfterRestore(receipt, fileTree.selectedPath, requestFileTree, openFile);
+            }}
+          />
         </div>
       </section>
     </div>

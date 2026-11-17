@@ -3973,6 +3973,37 @@ impl RunEngine {
                     .to_owned(),
             ));
         }
+        // Preflight before creating the card: a command that the shell policy or
+        // jail will refuse must never consume operator consent. checkpoint_restore
+        // has its own bridge-side preflight and is excluded here.
+        if matches!(
+            plan.tool.as_str(),
+            "file_write" | "apply_patch" | "run_tests" | "git_stage" | "git_commit" | "shell_exec"
+        ) {
+            if let Err(refusal) = tools.preflight_model_tool_approval(
+                &self.tool_registry,
+                &self.shell_policy,
+                task_agent_tier(task),
+                &plan.tool,
+                &plan.args,
+            ) {
+                hiverouter_tools::record_refusal(
+                    task.run_id,
+                    refusal,
+                    ToolId::from_id(&plan.tool),
+                    tool_loop::permission_for(&self.tool_registry, &plan.tool),
+                );
+                return Ok(ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    refusal.code(),
+                    format!(
+                        "preflight refused {:?} before approval: {}; no approval was created",
+                        plan.tool,
+                        refusal.message()
+                    ),
+                ));
+            }
+        }
         let now = self.now_unix_secs();
         let event = tools
             .request_model_tool_approval(run.id, task.id, &plan.tool_call_id, &plan.tool, &plan.args)?;
@@ -6393,6 +6424,10 @@ impl RunEngine {
                 self.fail_task(run, task, AgentState::Cancelled)?;
                 return Err(Refusal::ToolCancelled);
             }
+            // Every intermediate tool-call reply is a billable provider call.
+            // complete_task only accounts the final reply; account this turn
+            // before executing its tools, exactly once per served reply.
+            self.add_run_usage(run.id, final_reply.usage);
             let mut turn = match self
                 .execute_tool_turn(run, task, &final_reply, &transcript, token)
                 .await
@@ -6472,11 +6507,13 @@ impl RunEngine {
                     .map_or_else(|| finish_result.text.clone(), str::to_owned);
                 let terminal = StreamedReply {
                     deltas: if verdict.is_empty() { Vec::new() } else { vec![verdict] },
+                    // Keep measured usage for the REPLY_DONE event; the run
+                    // total is not incremented again (account_usage=false).
                     usage: final_reply.usage,
                     tool_calls: Vec::new(),
                     reasoning: final_reply.reasoning.clone(),
                 };
-                return self.complete_task(run, task, &terminal);
+                return self.complete_task(run, task, &terminal, false);
             }
             // `report_result` reports this task's result to its parent. The
             // engine persists it as the task's final assistant message and
@@ -6510,11 +6547,13 @@ impl RunEngine {
                 }
                 let terminal = StreamedReply {
                     deltas: if report_text.is_empty() { Vec::new() } else { vec![report_text] },
+                    // Keep measured usage for the REPLY_DONE event; the run
+                    // total is not incremented again (account_usage=false).
                     usage: final_reply.usage,
                     tool_calls: Vec::new(),
                     reasoning: final_reply.reasoning.clone(),
                 };
-                return self.complete_task(run, task, &terminal);
+                return self.complete_task(run, task, &terminal, false);
             }
             transcript.push(ToolTurnTranscript {
                 assistant_text: final_reply.text(),
@@ -6557,7 +6596,7 @@ impl RunEngine {
             final_reply = continuation;
         }
 
-        match self.complete_task(run, task, &final_reply) {
+        match self.complete_task(run, task, &final_reply, true) {
             Ok(text) => Ok(text),
             Err(refusal) => {
                 let state = if refusal == Refusal::ToolCancelled {
@@ -6583,6 +6622,7 @@ impl RunEngine {
         run: &Run,
         task: &TaskRecord,
         reply: &StreamedReply,
+        account_usage: bool,
     ) -> Result<Option<String>, Refusal> {
         let _guard = self
             .task_state_lock
@@ -6623,7 +6663,9 @@ impl RunEngine {
             Some(run.id),
             None,
         );
-        self.add_run_usage(run.id, reply.usage);
+        if account_usage {
+            self.add_run_usage(run.id, reply.usage);
+        }
         if !text.trim().is_empty() && memory_text_is_safe(&text) {
             let bounded: String = text.chars().take(2_000).collect();
             // Completion is already published. A best-effort memory write must

@@ -1,0 +1,37 @@
+{
+  "auth": {
+    "baseURL": "http://127.0.0.1:8099",
+    "gated": true,
+    "unauthSessionStatus": 403,
+    "tokenPresent": true,
+    "tokenSource": "file:launch.token",
+    "tokenFingerprint": "c1a7cb5a6ad4",
+    "dataDirConfigured": true,
+    "dataDirSource": "LOCALAPPDATA"
+  },
+  "sessionWithoutToken": {
+    "status": 403,
+    "code": "E_ORIGIN_REJECTED"
+  },
+  "sessionWithInvalidToken": {
+    "status": 403,
+    "code": "E_ORIGIN_REJECTED"
+  },
+  "sessionWithToken": {
+    "status": 200,
+    "schema": "hiverouter.v1",
+    "tokenPresent": true,
+    "lastSeq": 1985,
+    "ws": "/ws"
+  },
+  "gatedReadWithoutToken": {
+    "path": "/api/logs?source=stdout&tail=1",
+    "status": 403,
+    "code": "E_ORIGIN_REJECTED"
+  },
+  "gatedReadWithToken": {
+    "path": "/api/logs?source=stdout&tail=1",
+    "status": 200
+  },
+  "note": "server is launch-gated (HIVEROUTER_LAUNCH_TOKEN configured)"
+}

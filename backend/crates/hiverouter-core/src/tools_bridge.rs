@@ -530,6 +530,32 @@ impl ToolsBridge {
         .await
     }
 
+    /// Runs the same read-only preflight used by the executor **before** an
+    /// operator approval is requested. A command that the shell policy or
+    /// workspace jail will refuse must not create an approval card and burn
+    /// operator consent.
+    pub fn preflight_model_tool_approval(
+        &self,
+        registry: &hiverouter_tools::tool::ToolRegistry,
+        shell_policy: &hiverouter_tools::shell::ShellPolicy,
+        tier: hiverouter_tools::tool::AgentTier,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<(), Refusal> {
+        let jail = self.require_jail()?;
+        hiverouter_tools::side_effects::preflight_side_effect(
+            jail,
+            registry,
+            shell_policy,
+            tier,
+            tool,
+            args,
+            None,
+        )
+        .map(|_| ())
+        .map_err(Self::map_tool_error)
+    }
+
     /// Executes one approved `checkpoint_restore` call.
     ///
     /// Tier/schema and checkpoint/path checks happen before the grant CAS, so a

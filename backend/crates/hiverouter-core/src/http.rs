@@ -4537,25 +4537,42 @@ async fn run_usage(
     let Ok(run_id) = run_id.parse::<hiverouter_contract::RunId>() else {
         return refusal_response(StatusCode::NOT_FOUND, &hiverouter_contract::Refusal::RunNotFound);
     };
-    if let Err(refusal) = state.engine.store.get_run(run_id) {
-        return refusal_response(StatusCode::NOT_FOUND, &refusal);
-    }
+    let run = match state.engine.store.get_run(run_id) {
+        Ok(run) => run,
+        Err(refusal) => return refusal_response(StatusCode::NOT_FOUND, &refusal),
+    };
     match state.engine.store.run_usage(run_id) {
-        Ok(Some(usage)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "run_id": run_id.to_string(),
-                "usage": {
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                    "prompt_cache_hit_tokens": usage.prompt_cache_hit_tokens,
-                    "prompt_cache_miss_tokens": usage.prompt_cache_miss_tokens,
-                    "reasoning_tokens": usage.reasoning_tokens,
-                },
-            })),
-        )
-            .into_response(),
+        Ok(Some(usage)) => {
+            let complete = usage.prompt_tokens.is_some()
+                && usage.completion_tokens.is_some()
+                && usage.total_tokens.is_some()
+                && usage.prompt_cache_hit_tokens.is_some()
+                && usage.prompt_cache_miss_tokens.is_some()
+                && usage.reasoning_tokens.is_some();
+            let status = if complete { "complete" } else { "partial" };
+            let provenance = if complete { "measured" } else { "partial" };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": run_id.to_string(),
+                    "usage": {
+                        "status": status,
+                        "provenance": provenance,
+                        "final": run.status.is_terminal(),
+                        // Provider-call count is not persisted yet. Null means
+                        // unknown; it is never fabricated as 0.
+                        "calls": serde_json::Value::Null,
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "prompt_cache_hit_tokens": usage.prompt_cache_hit_tokens,
+                        "prompt_cache_miss_tokens": usage.prompt_cache_miss_tokens,
+                        "reasoning_tokens": usage.reasoning_tokens,
+                    },
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::OK,
             Json(serde_json::json!({ "run_id": run_id.to_string(), "usage": null })),

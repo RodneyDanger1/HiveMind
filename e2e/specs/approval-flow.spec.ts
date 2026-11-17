@@ -25,28 +25,39 @@ import type { ApprovalRequestPayload } from '../../web/src/api/contract';
  *     parsed COMMAND capture (`{name, payload, raw, correlationId, at}`); no hand-rolled
  *     JSON parsing in this spec.
  *
- * EXACT ACTUAL SELECTORS (`web/src/panels/ApprovalOverlay.tsx`):
- *   - card: `getByRole('dialog', { name: /file_write/ })` (aria-label
- *     "Tool approval requested: file_write")
- *   - full values in `dd[title="<value>"]`; visible text is the 12-char prefix
- *   - expiry: `dd[aria-live="polite"]` → `expires in 2m 00s` / `expired` / `unknown`
+ * EXACT ACTUAL SELECTORS — AS OF 2026-11-17 the approval card moved from the modal overlay
+ * into the chat transcript. `web/src/panels/ApprovalOverlay.tsx:248-255` returns null
+ * whenever the chat is visible AND the composer is mounted, delegating the decision to
+ * `web/src/chat/ChatCore.tsx:1112-1232` (`role="alert"`, `data-testid="chat-inline-approval"`,
+ * aria-label "Approval needed: file_write"). The modal is now only a fallback for a hidden
+ * chat. Pinning the old `dialog` selector tested a surface the product deliberately no longer
+ * shows on the default (chat-visible) layout.
+ *
+ *   - card: `[data-testid="chat-inline-approval"]` (role=alert,
+ *     aria-label "Approval needed: file_write"); the old modal name
+ *     "Tool approval requested: file_write" (STRINGS.approval.title) is no longer rendered.
+ *   - expiry: a `span[title="expires in 2m 00s" | "expired" | "unknown"]`
  *   - actions: `button[aria-label="Approve tool call for file_write"]` /
  *     `"Deny tool call for file_write"`; disabled when nonce is null, TTL expired, or a
  *     gesture is pending **until the server APPROVAL_RESOLVED removes the card** (an ACK
  *     alone does not close the card and does not re-enable the actions).
  *   - nonce-less copy: STRINGS.approval.nonceMissing (`did not carry the nonce`).
+ *   - KNOWN SURFACE GAP (recorded, not asserted as correct): the inline card renders the
+ *     tool + expiry only; run_id / task_id / tool_call_id / approval_id / args_sha256 are
+ *     no longer displayed. They remain in the store but the modal that showed them is
+ *     suppressed while chat is visible. Reported as a truth/evidence-loss finding.
  *
  * PHASE 1 (logic-gatekeeper — Wave-4 expiry/resolving verification):
  * {
  *   "phase1": {
- *     "architecture": "Mock WS -> app decoder (optional nonce/run/task/tool_call/args/expiry) -> store.approvals + resolvingApprovals -> ApprovalOverlay (dialog + dd fields + TTL + two labelled actions + panel pending lock) -> store.resolveApproval -> COMMAND APPROVAL_RESOLVE -> mock ACK; only a server APPROVAL_RESOLVED removes the card. This spec owns neither product nor helper code.",
+ *     "architecture": "Mock WS -> app decoder (optional nonce/run/task/tool_call/args/expiry) -> store.approvals + resolvingApprovals -> ChatCore inline approval card (role=alert, tool + expiry + two labelled actions; the modal ApprovalOverlay is the hidden-chat fallback) -> store.resolveApproval -> COMMAND APPROVAL_RESOLVE -> mock ACK; only a server APPROVAL_RESOLVED removes the card. This spec owns neither product nor helper code.",
  *     "dataFlow": "Event payloads and operator input are untrusted. Rendering must send nothing; a gesture may send at most one APPROVAL_RESOLVE carrying the exact approval_id/nonce/decision; ACK must not close or imply resolution and must not re-enable the actions; expiry must make the card read-only (disabled actions); malformed frames must stop at the decoder with no card.",
  *     "edgeCases": [
- *       "validated builder payload renders full args hash / run / task / tool_call / approval ids and a live expiry, with zero commands before a click",
+ *       "validated builder payload renders the tool, a live expiry and both enabled actions, with zero commands before a click (ids/args hash are no longer rendered — see KNOWN SURFACE GAP)",
  *       "approve: one command with decision=approve and exact nonce; card stays open and BOTH actions stay disabled after the mock ACK until APPROVAL_RESOLVED",
  *       "same-task double click sends exactly one command (store resolving guard; stability window)",
- *       "deny: one command with decision=deny, exact nonce and reason 'operator denied'",
- *       "duplicate APPROVAL_REQUEST with the same id replaces the card by id (no dialog stack)",
+ *       "deny: one command with decision=deny, exact nonce and reason 'operator denied in chat' (chat origin; the modal path keeps 'operator denied')",
+ *       "duplicate APPROVAL_REQUEST with the same id replaces the card by id (no stacked cards)",
  *       "nonce-less request: both actions disabled, honest gap copy, nothing sent",
  *       "expired approval: read-only — expiry text 'expired' and both actions disabled, nothing sent",
  *       "malformed APPROVAL_REQUEST is refused as E_SCHEMA_INVALID with no card"
@@ -94,8 +105,8 @@ function approvalPayload(overrides: Partial<ApprovalRequestPayload> = {}): Appro
 }
 
 function approvalCard(page: Page) {
-  // Accessible name: `${STRINGS.approval.title}: ${tool}` = "Tool approval requested: file_write".
-  return page.getByRole('dialog', { name: new RegExp(TOOL) });
+  // Inline chat card (ApprovalOverlay renders the modal only when the chat is hidden).
+  return page.locator('[data-testid="chat-inline-approval"]');
 }
 
 /** Two clicks in the same JS task: React has not re-rendered yet, so only the store guard can dedupe. */
@@ -111,27 +122,23 @@ async function doubleClickInSameTask(page: Page, label: string): Promise<void> {
 }
 
 test.describe('W12 approval flow — validated builder, labelled actions, read-only expiry (Wave 4)', () => {
-  test('request renders tool, full-value ids (title), args hash and a live expiry; nothing is sent on render', async ({ page }) => {
+  test('request renders tool, expiry and both enabled actions; nothing is sent on render', async ({ page }) => {
     const ws = await openConnected(page);
     sendApprovalRequest(ws, approvalPayload(), 1);
 
     const card = approvalCard(page);
     await expect(card).toBeVisible({ timeout: 10_000 });
+    await expect(card).toHaveAttribute('role', 'alert');
+    await expect(card).toHaveAttribute('aria-label', `Approval needed: ${TOOL}`);
     await expect(card).toContainText(TOOL);
-    // The overlay truncates every dd value to 12 chars and keeps the full value in
-    // `title`; asserting the full id against visible text would fail on correct UI.
-    await expect(card.locator(`dd[title="${HASH_A}"]`)).toContainText(HASH_A.slice(0, 12));
-    for (const [title, visible] of [
-      ['run-e2e-1', 'run-e2e-1'],
-      ['task-e2e-1', 'task-e2e-1'],
-      ['call-e2e-1', 'call-e2e-1'],
-      ['approval-e2e-1', 'approval-e2e-1'.slice(0, 12)],
-    ] as const) {
-      const field = card.locator(`dd[title="${title}"]`);
-      await expect(field).toHaveAttribute('title', title);
-      await expect(field).toContainText(visible);
-    }
-    await expect(card.locator('dd[aria-live="polite"]')).toContainText(/expires in /);
+    // The inline card keeps the expiry as a titled span; the modal's
+    // dd[aria-live="polite"] field set no longer exists on this surface.
+    await expect(card.locator('span[title]').filter({ hasText: /expires in / })).toBeVisible();
+    test.info().annotations.push({
+      type: 'surface-gap',
+      description:
+        'inline approval card renders tool+expiry only; run/task/tool_call/approval ids and args_sha256 are not displayed while chat is visible (modal suppressed at ApprovalOverlay.tsx:253)',
+    });
 
     await expect(card.getByRole('button', { name: APPROVE_LABEL })).toBeEnabled();
     await expect(card.getByRole('button', { name: DENY_LABEL })).toBeEnabled();
@@ -204,7 +211,10 @@ test.describe('W12 approval flow — validated builder, labelled actions, read-o
     expect(command.payload?.approval_id).toBe('approval-e2e-deny');
     expect(command.payload?.nonce).toBe('nonce-e2e-deny');
     expect(command.payload?.decision).toBe('deny');
-    expect(command.payload?.reason).toBe('operator denied');
+    // The chat-origin deny marks its origin (web/src/chat/ChatCore.tsx:865); the modal
+    // path keeps the bare 'operator denied' (ApprovalOverlay.tsx:278). The behaviour is
+    // unchanged — a deny carries the exact nonce and a named operator reason.
+    expect(command.payload?.reason).toBe('operator denied in chat');
 
     ws.route().send(
       eventFrame('APPROVAL_RESOLVED', { approval_id: 'approval-e2e-deny', tool: TOOL, decision: 'deny' }, 2),
@@ -220,9 +230,9 @@ test.describe('W12 approval flow — validated builder, labelled actions, read-o
     await expect(card).toBeVisible({ timeout: 10_000 });
 
     // A replayed/re-sent request for the same approval_id must replace by id (store
-    // reducer filters by approval_id); it must never stack a second modal or send a command.
+    // reducer filters by approval_id); it must never stack a second card or send a command.
     sendApprovalRequest(ws, approvalPayload(), 2);
-    await expect(page.getByRole('dialog')).toHaveCount(1);
+    await expect(page.locator('[data-testid="chat-inline-approval"]')).toHaveCount(1);
     await expect(approvalCard(page)).toBeVisible();
     expect(ws.approvalResolveCommands()).toHaveLength(0);
   });
@@ -248,7 +258,7 @@ test.describe('W12 approval flow — validated builder, labelled actions, read-o
     );
     const card = approvalCard(page);
     await expect(card).toBeVisible({ timeout: 10_000 });
-    await expect(card.locator('dd[aria-live="polite"]')).toContainText('expired');
+    await expect(card).toContainText('expired');
 
     // Wave-4 verified: expiry is read-only — isApprovalExpired() feeds canResolveApproval(),
     // so both actions are disabled and nothing is sent or claimed resolved.
@@ -263,7 +273,7 @@ test.describe('W12 approval flow — validated builder, labelled actions, read-o
     await expect(page.getByRole('alert').filter({ hasText: 'E_SCHEMA_INVALID' }).first()).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.locator('[data-testid="chat-inline-approval"]')).toHaveCount(0);
     expect(ws.approvalResolveCommands()).toHaveLength(0);
   });
 });

@@ -1,19 +1,57 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { appMissing, skipReason } from '../helpers/matrix';
 import { captureFrames, parseFrames, shot, waitForFrame, writeEvidence } from '../helpers/evidence';
 import { contrastRatio } from '../helpers/contrast';
+import {
+  assertStrictLaunchAuth,
+  describeAuth,
+  gotoWithLaunch,
+  launchUrl,
+  resolveAppAuth,
+  safeUrl,
+  type AppAuth,
+} from '../helpers/app-auth';
 
-const BASE = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:8799';
+/**
+ * LIVE app spec — drives the real, already-open HiveMind launcher instance.
+ *
+ * AUTH CONTRACT (see e2e/helpers/app-auth.ts):
+ * The launcher opens `http://127.0.0.1:<port>/?launch=<secret>`; the server refuses every
+ * unauthenticated `/api/*` GET with 403 E_ORIGIN_REJECTED. Playwright's fresh context does
+ * not inherit the launcher window, so EVERY navigation here must carry `?launch=` or the
+ * session/WS never authenticates. Resolving that token is the harness's job, not a product
+ * allowance — the negative tests below pin the refusal direction.
+ *
+ * No new server is started by this file; it only drives the instance named by E2E_BASE_URL
+ * (default: the documented launcher bind 127.0.0.1:8099).
+ */
+const BASE = (process.env.E2E_BASE_URL ?? 'http://127.0.0.1:8099').replace(/\/+$/, '');
 
-async function gotoApp(page: import('@playwright/test').Page, path = '/') {
-  const response = await page.goto(BASE + path, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForTimeout(600);
-  return response;
+/**
+ * SECRET HYGIENE: the launcher token lives in the page URL (`?launch=`), and Playwright's
+ * failure traces record page URLs and request headers verbatim. A retained trace therefore
+ * writes the per-boot launch secret into the retained trace archive. Live navigation must
+ * run with tracing off; failure screenshots (no URL bar) and the JSON evidence below still
+ * carry the diagnosis. Verified leak: one trace held the token in 24 records on 2026-11-17.
+ */
+test.use({ trace: 'off' });
+
+let authPromise: Promise<AppAuth> | null = null;
+
+/** Resolves (once) the launch token + gate state of the running instance. */
+function auth(): Promise<AppAuth> {
+  authPromise ??= resolveAppAuth(BASE);
+  return authPromise;
+}
+
+async function gotoApp(page: Page, path = '/'): Promise<Awaited<ReturnType<typeof gotoWithLaunch>>> {
+  return gotoWithLaunch(page, await auth(), path);
 }
 
 test.describe('live app — boot & surfaces', () => {
   test('boot: 200, title, #root, skip link text/href', async ({ page }, testInfo) => {
     test.skip(appMissing(), skipReason());
+    const session = await auth();
     const response = await gotoApp(page);
     expect(response?.status()).toBe(200);
     await expect(page).toHaveTitle('HiveMind — Spatial Execution Environment');
@@ -24,7 +62,15 @@ test.describe('live app — boot & surfaces', () => {
     const bodyText = await page.locator('body').innerText();
     expect(bodyText.length).toBeGreaterThan(400);
     const screenshot = await shot(page, 'boot', testInfo);
-    writeEvidence('01-boot.json', { status: response?.status(), title: await page.title(), skipLink: { text: await skip.innerText(), href: await skip.getAttribute('href') }, screenshot, bodyTextLen: bodyText.length });
+    writeEvidence('01-boot.json', {
+      status: response?.status(),
+      title: await page.title(),
+      skipLink: { text: await skip.innerText(), href: await skip.getAttribute('href') },
+      screenshot,
+      bodyTextLen: bodyText.length,
+      urlWithoutLaunchToken: safeUrl(page.url(), session.token),
+      auth: describeAuth(session),
+    });
   });
 
   test('skip link target #hive-canvas exists', async ({ page }) => {
@@ -91,6 +137,109 @@ test.describe('live app — boot & surfaces', () => {
       minimap: { testid: 'rf__minimap', ariaLabel: await page.locator('[data-testid="rf__minimap"]').getAttribute('aria-label') },
       zoomButtons: ['Zoom in', 'Zoom out', 'Recentre hive (Ctrl+0)', 'Fit swarm'],
       screenshot,
+    });
+  });
+});
+
+test.describe('live app — launch-token auth (strict)', () => {
+  test('HTTP gate: /api/session and a read route refuse missing/invalid launch tokens', async ({ request }) => {
+    test.skip(appMissing(), skipReason());
+    const session = await auth();
+    const evidence = await assertStrictLaunchAuth(request, session);
+    writeEvidence('16-auth-gate.json', evidence);
+    // The evidence file must never contain the live token itself.
+    expect(JSON.stringify(evidence)).not.toContain(String(session.token ?? '::none::'));
+  });
+
+  test('authed navigation: launcher URL boots the app, /api/session 200, WS receives SERVER_HELLO', async ({ page }) => {
+    test.skip(appMissing(), skipReason());
+    const session = await auth();
+    const frames = captureFrames(page).frames;
+    const wsUrls: string[] = [];
+    const sessionReads: Array<{ status: number; url: string }> = [];
+    page.on('websocket', (ws) => wsUrls.push(ws.url()));
+    page.on('response', (response) => {
+      if (new URL(response.url()).pathname === '/api/session') {
+        sessionReads.push({ status: response.status(), url: safeUrl(response.url(), session.token) });
+      }
+    });
+    const response = await gotoApp(page);
+    expect(response?.status()).toBe(200);
+    const hello = await waitForFrame(frames, (frame) => frame.type === 'EVENT' && frame.name === 'SERVER_HELLO');
+    expect(hello).toMatchObject({ schema: 'hiverouter.v1', type: 'EVENT', name: 'SERVER_HELLO' });
+    expect(sessionReads.some((read) => read.status === 200), 'the page must read /api/session successfully with the launcher token').toBe(true);
+    expect(wsUrls.length, 'an authed boot must open the WebSocket').toBeGreaterThan(0);
+    // The socket is authenticated by the per-boot session token; the launch secret stays in the HTTP header.
+    expect(wsUrls[0]).not.toContain(String(session.token ?? '::none::'));
+    writeEvidence('17-auth-positive.json', {
+      htmlStatus: response?.status(),
+      sessionReads,
+      wsOpened: wsUrls.length,
+      wsUrlHasLaunchToken: session.token === null ? false : wsUrls[0].includes(session.token),
+      serverHello: { name: String(hello.name), schema: String(hello.schema) },
+      auth: describeAuth(session),
+    });
+  });
+
+  test('missing launch token: /api/session 403 E_ORIGIN_REJECTED, no WS, refusal banner', async ({ page }) => {
+    test.skip(appMissing(), skipReason());
+    const session = await auth();
+    test.skip(!session.gated, 'server started without HIVEROUTER_LAUNCH_TOKEN: the launch gate is off');
+    const sockets: string[] = [];
+    page.on('websocket', (ws) => sockets.push(ws.url()));
+    const sessionRead = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === '/api/session',
+      { timeout: 15_000 },
+    );
+    await page.goto(`${BASE}/`, { waitUntil: 'networkidle', timeout: 30_000 });
+    const response = await sessionRead;
+    expect(response.status(), 'missing launch token must be refused').toBe(403);
+    const body = (await response.json()) as { code?: string; message?: string };
+    expect(body.code).toBe('E_ORIGIN_REJECTED');
+    expect(body.message ?? '').toMatch(/launcher token/i);
+    // The splash veil holds ~4.2s + 1.8s grace before the named refusal is visible.
+    await expect(
+      page.getByRole('alert').filter({ hasText: /launcher token/i }).first(),
+      'the unauthenticated boot must surface a named refusal, not a silent offline app',
+    ).toBeVisible({ timeout: 15_000 });
+    expect(sockets, 'no WebSocket may open without an authenticated session').toHaveLength(0);
+    writeEvidence('18-auth-missing-token.json', {
+      sessionStatus: response.status(),
+      refusalCode: body.code,
+      refusalMessage: body.message,
+      websocketsOpened: sockets.length,
+      urlHasLaunchParam: new URL(page.url()).searchParams.has('launch'),
+    });
+  });
+
+  test('invalid launch token: /api/session 403 E_ORIGIN_REJECTED, no WS, refusal banner', async ({ page }) => {
+    test.skip(appMissing(), skipReason());
+    const session = await auth();
+    test.skip(!session.gated, 'server started without HIVEROUTER_LAUNCH_TOKEN: the launch gate is off');
+    const sockets: string[] = [];
+    page.on('websocket', (ws) => sockets.push(ws.url()));
+    const forged = 'e2e-forged-launch-token-000000000000';
+    const sessionRead = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === '/api/session',
+      { timeout: 15_000 },
+    );
+    await page.goto(launchUrl(BASE, '/', forged), { waitUntil: 'networkidle', timeout: 30_000 });
+    const response = await sessionRead;
+    expect(response.status(), 'an invalid launch token must be refused').toBe(403);
+    const body = (await response.json()) as { code?: string; message?: string };
+    expect(body.code).toBe('E_ORIGIN_REJECTED');
+    expect(body.message ?? '').toMatch(/launcher token/i);
+    await expect(
+      page.getByRole('alert').filter({ hasText: /launcher token/i }).first(),
+      'the forged-token boot must surface a named refusal',
+    ).toBeVisible({ timeout: 15_000 });
+    expect(sockets, 'no WebSocket may open without an authenticated session').toHaveLength(0);
+    writeEvidence('19-auth-invalid-token.json', {
+      sessionStatus: response.status(),
+      refusalCode: body.code,
+      refusalMessage: body.message,
+      websocketsOpened: sockets.length,
+      forgedTokenFingerprint: 'e2e-forged-launch-token',
     });
   });
 });
@@ -186,22 +335,54 @@ test.describe('live app — safe interactions & render-back', () => {
     writeEvidence('09-empty-prompt.json', { toastShown: true, submitFramesSent: sent.length });
   });
 
-  test('WS handshake uses /api/session token and hello{last_seq}; SERVER_HELLO received', async ({ page, request }) => {
+  test('WS handshake uses the page session token and hello{last_seq}; SERVER_HELLO received', async ({ page }) => {
     test.skip(appMissing(), skipReason());
-    const session = await (await request.get('/api/session')).json() as { token: string; last_seq: number };
+    const session = await auth();
     const frames = captureFrames(page).frames;
-    const urls: string[] = [];
-    page.on('websocket', (ws) => urls.push(ws.url()));
+    const wsUrls: string[] = [];
+    page.on('websocket', (ws) => wsUrls.push(ws.url()));
+    let pageSession: { token: string; last_seq: number } | null = null;
+    page.on('response', (response) => {
+      // Keep the FIRST 200 read: later reconnects re-read /api/session against a moving
+      // live bus, so a later last_seq is not the one the first socket was opened with.
+      if (pageSession !== null) return;
+      if (new URL(response.url()).pathname === '/api/session' && response.status() === 200) {
+        response
+          .json()
+          .then((body) => {
+            const parsed = body as { token?: unknown; last_seq?: unknown };
+            if (typeof parsed.token === 'string' && typeof parsed.last_seq === 'number') {
+              pageSession = { token: parsed.token, last_seq: parsed.last_seq };
+            }
+          })
+          .catch(() => {
+            // Evidence below records the missing page session; the assertion fails loudly.
+          });
+      }
+    });
     await gotoApp(page);
-    const hello = await waitForFrame(frames, (j) => j.name === 'SERVER_HELLO' || (j as { type?: string }).type === 'EVENT');
+    const hello = await waitForFrame(frames, (j) => (j as { type?: string }).type === 'EVENT' && j.name === 'SERVER_HELLO');
     const sentHello = await waitForFrame(frames, (j) => (j as { type?: string }).type === 'hello');
-    expect(urls.length).toBeGreaterThan(0);
-    const wsUrl = new URL(urls[0]);
-    expect(wsUrl.searchParams.get('token')).toBe(session.token);
-    expect(wsUrl.searchParams.get('last_seq')).toBe(String(session.last_seq));
-    expect(sentHello).toMatchObject({ type: 'hello', last_seq: session.last_seq });
+    // The page's OWN session read is the only correct baseline: the live bus moves between
+    // reads, so a separate request cannot be compared to the socket the app already opened.
+    await expect.poll(() => pageSession !== null, { timeout: 10_000 }).toBe(true);
+    const own = pageSession as unknown as { token: string; last_seq: number };
+    expect(wsUrls.length).toBeGreaterThan(0);
+    const wsUrl = new URL(wsUrls[0]);
+    expect(wsUrl.searchParams.get('token')).toBe(own.token);
+    const wsLastSeq = Number(wsUrl.searchParams.get('last_seq'));
+    expect(Number.isInteger(wsLastSeq), 'WS last_seq must be an integer seq').toBe(true);
+    expect(wsLastSeq, 'the socket opens at the page session last_seq').toBe(own.last_seq);
+    expect(sentHello).toMatchObject({ type: 'hello', last_seq: wsLastSeq });
     expect(hello).toMatchObject({ schema: 'hiverouter.v1', type: 'EVENT', name: 'SERVER_HELLO' });
-    writeEvidence('10-ws-handshake.json', { wsUrlTokenMatchesSession: true, sentHello, serverHello: { name: hello.name, schema: hello.schema, seq: hello.seq } });
+    // Never persist either live secret: fingerprints/booleans only.
+    writeEvidence('10-ws-handshake.json', {
+      wsTokenMatchesPageSession: true,
+      lastSeq: own.last_seq,
+      wsUrlHasLaunchToken: session.token === null ? false : wsUrls[0].includes(session.token),
+      sentHello,
+      serverHello: { name: hello.name, schema: hello.schema, seq: hello.seq },
+    });
   });
 
   test('computed token colours: canvas/panel/body text contrast >= 4.5', async ({ page }) => {

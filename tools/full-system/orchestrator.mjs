@@ -17,11 +17,13 @@ import {
   startCampaign,
   writeEvent,
 } from './lib/engine.mjs';
+import { verifyWatchdogSeal } from './watchdog.mjs';
 
 const ROOT = resolve(import.meta.dirname, '..', '..');
 const { id, root } = createCampaignRoot(process.env.FS_PREFIX || 'campaign');
 const checks = [];
 let campaign = null;
+let campaignServerPid = null;
 let watchdogs = [];
 
 function record(id, status, expected, actual, evidence = [], severity = 'P1') {
@@ -113,6 +115,7 @@ async function main() {
   // ── Deterministic approval-gated run + watchdogs ─────────────────────────
   try {
     campaign = await startCampaign({ root, mode: 'tools' });
+    campaignServerPid = campaign.serverPid;
     pass('CORE/BOOT-01', 'real server health + schema', `${campaign.health.status}, schema ${campaign.health.database?.schema_version ?? campaign.health.schema}`, [join(root, 'evidence', 'session.json')]);
 
     const launch = campaign.launch;
@@ -195,8 +198,6 @@ async function main() {
     const bootId = campaign.health?.boot_id || campaign.health?.bootId || null;
     if (campaign.health?.status === 'ok' && bootId) pass('S6/IDENTITY-01', 'strict health carries schema + boot_id', `boot_id=${bootId}`);
     else fail('S6/IDENTITY-01', 'strict health carries schema + boot_id', JSON.stringify(campaign.health).slice(0, 400), [], 'P1');
-    campaign.stop();
-    campaign = null;
   }
 
   const capsSource = readFileSync(join(ROOT, 'backend', 'crates', 'hiverouter-core', 'src', 'caps.rs'), 'utf8');
@@ -224,10 +225,14 @@ async function main() {
       bytes: existsSync(ledger) ? statSync(ledger).size : 0,
     };
   }
-  writeFileSync(join(root, 'evidence', 'watchdogs.json'), JSON.stringify(ledgerReports, null, 2));
-  const watchdogOk = Object.values(ledgerReports).every((entry) => entry.exists && entry.bytes > 0);
-  if (watchdogOk) pass('WATCHDOG/01', 'all four ledgers have records', JSON.stringify(Object.fromEntries(Object.entries(ledgerReports).map(([k, v]) => [k, v.bytes]))));
-  else fail('WATCHDOG/01', 'all four ledgers have records', JSON.stringify(ledgerReports), [], 'P1');
+  const watchdogSeals = {};
+  for (const role of ['liveness', 'wire', 'artifact', 'defect']) {
+    watchdogSeals[role] = verifyWatchdogSeal({ root, role });
+  }
+  writeFileSync(join(root, 'evidence', 'watchdogs.json'), JSON.stringify({ ledgers: ledgerReports, seals: watchdogSeals }, null, 2));
+  const watchdogOk = Object.values(watchdogSeals).every((seal) => seal.pass);
+  if (watchdogOk) pass('WATCHDOG/01', 'all four ledgers are sealed and hash-chain verified', JSON.stringify(Object.fromEntries(Object.entries(watchdogSeals).map(([k, v]) => [k, v.reasons]))));
+  else fail('WATCHDOG/01', 'all four ledgers are sealed and hash-chain verified', JSON.stringify(Object.fromEntries(Object.entries(watchdogSeals).map(([k, v]) => [k, v.reasons]))), [join(root, 'evidence', 'watchdogs.json')], 'P1');
 
   const secretHits = scanForSecrets(root);
   writeFileSync(join(root, 'evidence', 'secret-scan.json'), JSON.stringify({ hits: secretHits }, null, 2));
@@ -272,10 +277,17 @@ async function main() {
     if (faultCampaign) faultCampaign.stop();
   }
 
-  const processList = spawnSync('tasklist', ['/FI', 'IMAGENAME eq hiverouter.exe'], { encoding: 'utf8', timeout: 10_000 });
-  const leaked = /hiverouter\.exe/i.test(processList.stdout || '') && !/INFO: No tasks/i.test(processList.stdout || '');
-  if (!leaked) pass('S10/CLEANUP-01', 'no hiverouter process survives the campaign', 'none');
-  else fail('S10/CLEANUP-01', 'no hiverouter process survives the campaign', (processList.stdout || '').slice(0, 400), [], 'P0');
+  if (campaign) {
+    campaign.stop();
+    campaign = null;
+  }
+
+  const processList = campaignServerPid === null
+    ? { stdout: 'no campaign server pid' }
+    : spawnSync('tasklist', ['/FI', `PID eq ${campaignServerPid}`], { encoding: 'utf8', timeout: 10_000 });
+  const leaked = campaignServerPid !== null && new RegExp(`\\b${campaignServerPid}\\b`).test(processList.stdout || '') && !/No tasks/i.test(processList.stdout || '');
+  if (!leaked) pass('S10/CLEANUP-01', 'campaign server process is gone', `pid=${campaignServerPid ?? 'none'}`);
+  else fail('S10/CLEANUP-01', 'campaign server process is gone', (processList.stdout || '').slice(0, 400), [], 'P0');
 
   // ── Static capability checks / remaining planned exams ───────────────────
   const providerLog = join(root, 'evidence', 'provider.jsonl');

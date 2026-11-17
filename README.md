@@ -82,7 +82,8 @@ The installed app was driven on screen with the real provider and real UI approv
 A live run completed with 4/4 tasks, created a file, and produced a checkpoint;
 a separate live run showed the approval card and resumed after **Approve**.
 The first live run also exposed a planner/persona mismatch (`content-writer` had no
-`file_write`), fixed and re-verified in the clean `e47d35a` build.
+`file_write`); the fix is in the clean `e47d35a` build, but the later live write used the
+generic `agent` role, so content-writer tool use is not yet live-attributed.
 Full live record and remaining defects:
 [live verification plan](docs/plans/FULL-SYSTEM-LIVE-VERIFICATION.md).
 

@@ -9,7 +9,7 @@
  */
 import type { ReactNode } from 'react';
 
-export type CostStatus = 'idle' | 'loading' | 'ready' | 'error' | 'unavailable';
+export type CostStatus = 'idle' | 'loading' | 'ready' | 'error' | 'unavailable' | 'unpriced';
 export type UsageSource = 'server' | 'derived' | 'unknown';
 
 export interface Usage {
@@ -39,6 +39,7 @@ export const COST_COPY = {
   retry: 'Retry',
   empty: 'No usage reported yet.',
   unavailable: 'Usage is incomplete; cost is not claimed.',
+  unpriced: 'Tokens measured; cost unpriced (external points endpoint).',
   costNotReported: 'Cost not reported',
   tokensNotReported: 'Tokens not reported',
   total: 'total',
@@ -137,6 +138,8 @@ export function costStatusLabel(status: CostStatus): string {
       return COST_COPY.error;
     case 'unavailable':
       return COST_COPY.unavailable;
+    case 'unpriced':
+      return COST_COPY.unpriced;
     case 'ready':
       return COST_COPY.section;
   }
@@ -221,6 +224,12 @@ export function CostBar({
         </p>
       ) : null}
 
+      {status === 'unpriced' ? (
+        <p role="status" className="type-mono-meta text-amber">
+          {COST_COPY.unpriced}
+        </p>
+      ) : null}
+
       {status === 'idle' ? (
         <p role="status" className="type-mono-meta text-meta">
           {COST_COPY.empty}
@@ -264,6 +273,11 @@ export function CostBar({
                 ? COST_COPY.costNotReported
                 : formatUsd(costUsd)}
             </span>
+            {costUsd === null || costUsd === undefined ? null : (
+              <span className="type-mono-meta rounded-[var(--radius-pill)] border border-hairline px-1.5 py-0.5 text-meta">
+                {COST_COPY.server}
+              </span>
+            )}
             {budget === null ? null : (
               <>
                 <div

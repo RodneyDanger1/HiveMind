@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { FileContentPayload, FileTreeEntry } from '../src/api/contract';
 import type { UiApi } from '../src/api/client';
-import { DataPanel } from '../src/panels/DataPanel';
+import { DataPanel, refreshAfterRestore } from '../src/panels/DataPanel';
 import { UiStoreContext } from '../src/state/context';
 import { createUiStore, type FileTreeState, type UiState } from '../src/state/store';
 import dataPanelSource from '../src/panels/DataPanel.tsx?raw';
@@ -153,5 +153,65 @@ describe('DataPanel state ownership', () => {
     expect(markup).toContain('Editor: README.md');
     expect(markup).toContain('STALE BODY');
     expect(markup).not.toContain('Retry README.md');
+  });
+});
+
+describe('refresh after a checkpoint restore', () => {
+  const receipt = {
+    path: 'live-content-writer-proof.md',
+    undoneSeqs: [1],
+    restored: { kind: 'absent' as const },
+  };
+
+  it('refreshes the tree and re-reads the restored file when it is the open preview', () => {
+    const calls: string[] = [];
+    refreshAfterRestore(
+      receipt,
+      'live-content-writer-proof.md',
+      async () => {
+        calls.push('tree');
+      },
+      async (path) => {
+        calls.push(`open:${path}`);
+      },
+    );
+    expect(calls).toEqual(['tree', 'open:live-content-writer-proof.md']);
+  });
+
+  it('never re-opens an unrelated preview path', () => {
+    const calls: string[] = [];
+    refreshAfterRestore(
+      receipt,
+      'README.md',
+      async () => {
+        calls.push('tree');
+      },
+      async (path) => {
+        calls.push(`open:${path}`);
+      },
+    );
+    expect(calls).toEqual(['tree']);
+  });
+
+  it('still refreshes the tree with no file selected', () => {
+    const calls: string[] = [];
+    refreshAfterRestore(
+      receipt,
+      null,
+      async () => {
+        calls.push('tree');
+      },
+      async (path) => {
+        calls.push(`open:${path}`);
+      },
+    );
+    expect(calls).toEqual(['tree']);
+  });
+
+  it('wires the restored receipt into the Data panel refresh', () => {
+    expect(dataPanelSource).toContain('onRestored={(receipt) => {');
+    expect(dataPanelSource).toContain(
+      'refreshAfterRestore(receipt, fileTree.selectedPath, requestFileTree, openFile)',
+    );
   });
 });

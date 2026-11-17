@@ -1,0 +1,7 @@
+{
+  "sessionStatus": 403,
+  "refusalCode": "E_ORIGIN_REJECTED",
+  "refusalMessage": "the launcher token is required to read the session",
+  "websocketsOpened": 0,
+  "urlHasLaunchParam": false
+}

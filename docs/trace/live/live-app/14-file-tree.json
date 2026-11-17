@@ -2,17 +2,49 @@
   "resultReceived": true,
   "entries": [
     {
-      "path": "README.md",
-      "name": "README.md",
-      "is_dir": false
+      "path": "HIVE-STATUS.md",
+      "name": "HIVE-STATUS.md",
+      "is_dir": false,
+      "kind": "file",
+      "size_bytes": 1114
     },
     {
-      "path": "note.txt",
-      "name": "note.txt",
-      "is_dir": false
+      "path": "hivemind-source",
+      "name": "hivemind-source",
+      "is_dir": true,
+      "kind": "dir",
+      "size_bytes": null
+    },
+    {
+      "path": "live-approval-2.md",
+      "name": "live-approval-2.md",
+      "is_dir": false,
+      "kind": "file",
+      "size_bytes": 16
+    },
+    {
+      "path": "live-approval.md",
+      "name": "live-approval.md",
+      "is_dir": false,
+      "kind": "file",
+      "size_bytes": 16
+    },
+    {
+      "path": "live-content-writer-proof.md",
+      "name": "live-content-writer-proof.md",
+      "is_dir": false,
+      "kind": "file",
+      "size_bytes": 22
+    },
+    {
+      "path": "live-proof.md",
+      "name": "live-proof.md",
+      "is_dir": false,
+      "kind": "file",
+      "size_bytes": 11
     }
   ],
-  "noteVisible": 1,
-  "readmeVisible": 1,
-  "mainText": "WORKSPACE\nSWARM\nROUTING\nHISTORY\n—\nSUPERAGENTS ·\n—\nWORKERS ·\n—\nGREEN\nNO METRICS\nPROJECT\nHiveMind AI · You\nCONNECTED\nData\nREADME.md—\nnote.txt—\n\nSelect a file from the tree to preview it here."
+  "noteVisible": 0,
+  "readmeVisible": 0,
+  "mainText": "Data\nWORKSPACE FILES\n5 FILES\nWORKSPACE\nREFRESH FILE TREE\nHIVE-STATUS.md\n1.1 KB\nhivemind-source\n+\nlive-approval-2.md\n16 B\nlive-approval.md\n16 B\nlive-content-writer-proof.md\n22 B\nlive-proof.md\n11 B\n\nSelect a file from the tree to preview it here.\n\nRun file changes\nRefresh run changes\n\nLine diff and merge apply/reject are unavailable.\n\nNo checkpoint content route: GET /api/runs/{run_id}/checkpoints returns before/after SHA-256 digests and sizes only, and no route returns the journalled pre-image by"
 }

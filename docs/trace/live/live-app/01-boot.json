@@ -6,5 +6,16 @@
     "href": "#hive-canvas"
   },
   "screenshot": "docs/trace/live/live-app/boot.png",
-  "bodyTextLen": 1022
+  "bodyTextLen": 6121,
+  "urlWithoutLaunchToken": "http://127.0.0.1:8099/?launch=[redacted-launch-token]",
+  "auth": {
+    "baseURL": "http://127.0.0.1:8099",
+    "gated": true,
+    "unauthSessionStatus": 403,
+    "tokenPresent": true,
+    "tokenSource": "file:launch.token",
+    "tokenFingerprint": "c1a7cb5a6ad4",
+    "dataDirConfigured": true,
+    "dataDirSource": "LOCALAPPDATA"
+  }
 }

@@ -3,11 +3,11 @@
   "responses": [
     {
       "name": "ACK",
-      "correlation_id": "01a1b175-0cbe-7d25-a25b-7e3c76dab55a"
+      "correlation_id": "01a1ebbd-8ed9-7217-99eb-6e21af87dfb7"
     },
     {
       "name": "SETTINGS_STATUS_RESULT",
-      "correlation_id": "01a1b175-0cbe-7d25-a25b-7e3c76dab55a"
+      "correlation_id": "01a1ebbd-8ed9-7217-99eb-6e21af87dfb7"
     }
   ]
 }

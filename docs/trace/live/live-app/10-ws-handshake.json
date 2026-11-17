@@ -1,8 +1,10 @@
 {
-  "wsUrlTokenMatchesSession": true,
+  "wsTokenMatchesPageSession": true,
+  "lastSeq": 2029,
+  "wsUrlHasLaunchToken": false,
   "sentHello": {
     "type": "hello",
-    "last_seq": 75
+    "last_seq": 2029
   },
   "serverHello": {
     "name": "SERVER_HELLO",

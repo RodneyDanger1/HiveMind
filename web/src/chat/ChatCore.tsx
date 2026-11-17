@@ -1168,6 +1168,19 @@ export function ChatCore() {
                   {pendingApproval.argsPreview}
                 </p>
               ) : null}
+              <details className="mt-1 text-[10px] leading-4 text-ink-500">
+                <summary className="cursor-pointer type-mono-meta text-meta">
+                  Binding evidence
+                </summary>
+                <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 font-mono">
+                  <dt>approval</dt><dd className="break-all">{pendingApproval.approvalId}</dd>
+                  <dt>run</dt><dd className="break-all">{pendingApproval.runId ?? 'unknown'}</dd>
+                  <dt>task</dt><dd className="break-all">{pendingApproval.taskId ?? 'unknown'}</dd>
+                  <dt>tool_call</dt><dd className="break-all">{pendingApproval.toolCallId ?? 'unknown'}</dd>
+                  <dt>args_sha256</dt><dd className="break-all">{pendingApproval.argsSha256 ?? 'unknown'}</dd>
+                  <dt>nonce</dt><dd className="break-all">{pendingApproval.nonce ?? 'missing'}</dd>
+                </dl>
+              </details>
               {pendingApproval.nonce === null ? (
                 <p className="mt-1 text-[10px] leading-4 text-signal">
                   {STRINGS.approval.nonceMissing}

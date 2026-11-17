@@ -726,7 +726,8 @@ function CanvasInner() {
       </div>
       <div
         role="group"
-        className="absolute bottom-32 left-3 flex flex-col gap-1"
+        className="absolute left-3 flex flex-col gap-1"
+        style={{ bottom: chatVisible ? 'calc(var(--chat-dock-height, 0px) + 16px)' : '8rem' }}
         aria-label="Zoom controls"
       >
 

@@ -50,11 +50,22 @@ impl Usage {
     /// carry a value (never fabricating a zero).
     #[must_use]
     pub fn checked_add(&self, other: &Usage) -> Usage {
+        // The empty accumulator is "no calls yet", not "an omitted counter".
+        // It adopts the first report; only a real mix of reported/omitted
+        // counters is unknown.
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
         fn add(left: Option<u64>, right: Option<u64>) -> Option<u64> {
             match (left, right) {
                 (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
+                // One contributing call omitted this counter: the aggregate is
+                // unknown, not the partial sum. Filling it would turn an
+                // INCOMPLETE run into a measured-looking total.
+                (Some(_), None) | (None, Some(_)) | (None, None) => None,
             }
         }
         Usage {
@@ -97,7 +108,8 @@ mod tests {
         };
         let sum = left.checked_add(&right);
         assert_eq!(sum.prompt_tokens, Some(12));
-        assert_eq!(sum.completion_tokens, Some(3));
+        // completion was omitted by the left call, so the aggregate is unknown.
+        assert_eq!(sum.completion_tokens, None);
         assert_eq!(sum.total_tokens, None);
     }
 }

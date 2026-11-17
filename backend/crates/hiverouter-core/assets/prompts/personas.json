@@ -13,7 +13,7 @@
     "display_name": "Content Writer",
     "tier": "worker",
     "template_id": "content-writer",
-    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
+    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "web_fetch"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },
@@ -22,7 +22,7 @@
     "display_name": "HiveMind SuperAgent",
     "tier": "super",
     "template_id": "superagent",
-    "allowed_tool_ids": ["spawn_agent", "ask_parent", "send_to_sibling", "file_read", "file_list", "report_result", "finish", "request_detached", "web_fetch", "vote_evolution", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search", "memory_recall", "checkpoint_restore"],
+    "allowed_tool_ids": ["spawn_agent", "ask_parent", "send_to_sibling", "file_read", "file_list", "file_write", "report_result", "finish", "request_detached", "web_fetch", "vote_evolution", "fs_glob", "fs_grep", "file_read_range", "apply_patch", "run_tests", "git_stage", "git_commit", "git_status", "git_diff", "git_log", "harness_diagnose", "repo_search", "memory_recall", "checkpoint_restore"],
     "output_schema_id": null,
     "refusal_policy": "strict",
     "max_children": 8,
@@ -42,7 +42,7 @@
     "display_name": "Data Analyst",
     "tier": "worker",
     "template_id": "data-analyst",
-    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "report_result", "finish", "web_fetch"],
+    "allowed_tool_ids": ["file_read", "file_list", "file_write", "ask_parent", "send_to_sibling", "web_fetch"],
     "output_schema_id": null,
     "refusal_policy": "strict"
   },

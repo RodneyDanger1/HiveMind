@@ -1,5 +1,5 @@
 {
-  "dataPanelText": "WORKSPACE\nSWARM\nROUTING\nHISTORY\n—\nSUPERAGENTS ·\n—\nWORKERS ·\n—\nGREEN\nNO METRICS\nPROJECT\nHiveMind AI · You\nCONNECTED\nData\nREADME.md—\nnote.txt—\n\nSelect a file from the tree to preview it here.",
+  "dataPanelText": "Data\nWORKSPACE FILES\n5 FILES\nWORKSPACE\nREFRESH FILE TREE\nHIVE-STATUS.md\n1.1 KB\nhivemind-source\n+\nlive-approval-2.md\n16 B\nlive-approval.md\n16 B\nlive-content-writer-proof.md\n22 B\nlive-proof.md\n11 B\n\nSelect a file from the tree to preview it here.\n\nRun file changes\nRefresh run changes\n\nLine diff and merge apply/reject are unavailable.\n\nNo checkpoint content route: GET /api/runs/{run_id}/checkpoints r",
   "staleDataClaim": false,
   "staleApprovalClaim": false,
   "frozenContractHas": {
