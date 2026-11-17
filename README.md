@@ -76,6 +76,16 @@ The UI is a spatial execution environment: the graph, hierarchy, run log, approv
 - Sandbox D1 is wired into shell execution: per-run temp, env scrub, job-object tree kill, and an explicit “not filesystem/network isolated” status.
 - Embeddings (exact cosine, loopback operator endpoint) and a bounded goal loop are implemented and tested as modules; DB/HTTP/engine wiring is next.
 - Hive geometry is now a single 620×660 viewBox scaled by CSS, eliminating the clipped landing board.
+## Live verification (2026-11-17)
+
+The installed app was driven on screen with the real provider and real UI approvals.
+A live run completed with 4/4 tasks, created a file, and produced a checkpoint;
+a separate live run showed the approval card and resumed after **Approve**.
+The first live run also exposed a planner/persona mismatch (`content-writer` had no
+`file_write`), fixed and re-verified in the clean `e47d35a` build.
+Full live record and remaining defects:
+[live verification plan](docs/plans/FULL-SYSTEM-LIVE-VERIFICATION.md).
+
 Read the full evidence and boundaries:
 [delegation audit](docs/evidence/delegation-audit-20261113-163346.md),
 [hierarchy research](docs/research/HIERARCHICAL-DELEGATION.md),

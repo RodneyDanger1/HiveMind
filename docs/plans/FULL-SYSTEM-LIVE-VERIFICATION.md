@@ -14,18 +14,20 @@ The product is accepted only by driving the **installed `HiveMind.exe` window wi
 | `01a1eb57-e6d6-767b-a072-7c7b46e0dc69` | second prompt arrived truncated (UI automation issue, not model) | none | trusted | invalid input; rerun |
 | `01a1eb58-ffb0-75cc-b559-45e27be7e254` | real model created `live-proof.md` via agent | 11 bytes, checkpoint seq 1 | trusted | PASS for artifact; no human approval because trusted auto-grants |
 | `01a1eb59-a5ea-72f8-91b1-19e794f65e49` | real model created `live-approval.md` | 16 bytes | trusted | PASS artifact; auto-granted |
-| `01a1eb5a-3b83-7583-8328-95c5a2128263` | real model created `live-approval-2.md`; two `shell_exec` cards shown; operator clicked **Approve** twice in the live window; run resumed to completed | 16 bytes, checkpoint seq 1 | **stored trusted despite session set to classic** | **FAIL policy truth / PASS approval UI** |
+| `01a1eb5a-3b83-7583-8328-95c5a2128263` | real model created `live-approval-2.md`; two `shell_exec` cards shown; operator clicked **Approve** twice in the live window; run resumed to completed | 16 bytes, checkpoint seq 1 | trusted (UI local policy) | PASS approval UI |
+| `01a1eb7a-1539-753a-bc95-ee9a4a3e07d7` | after the clean `e47d35a` install, real model created `live-content-writer-proof.md`; monitor shows `FILE_WRITE OK`; 4/4 tasks completed | 22 bytes `CONTENT WRITER LIVE OK`, checkpoint seq 1 | trusted (UI local policy) | **PASS live file creation** |
 
-Live UI screenshot: `docs/evidence/screenshots/live-approval-completed.png` (completed run, 4/4, 100% green, two workers, artifact created).
+Live UI screenshot: `docs/evidence/screenshots/live-approval-completed.png` and `live-content-writer-fixed.png` (completed runs, 4/4, 100% green, workers, artifacts).
 Approval screenshot set: `live-approval-card.png`, `live-submitted.png`, `live-typed.png`.
 
-## Live defects found
+## Live defects found and status
 
-1. **P1 — false completion without deliverable.** Planner selects `content-writer` for a file-creation task, but `content-writer` has no `file_write`; the run ends `completed` with no artifact. Fix: either add `file_write` to the content-writer persona or make planner choose a write-capable persona for file deliverables; add a post-run artifact assertion.
-2. **UI policy state, not a server bug.** The live window keeps its own local policy (`trusted`) and sends it with `SUBMIT_PROMPT`; changing the session through HTTP does not change that local control. The run row correctly stored `trusted`, and `shell_exec` still asked because it is outside the workspace path. Fix the test procedure: set policy through the visible UI control (or `localStorage`) and verify the next run row, rather than changing the session API behind the UI.
+1. **P1 — false completion without deliverable (fixed in `e47d35a`).** The planner selected `content-writer` for a file-creation task, but that persona had no `file_write`; the run ended `completed` with no artifact. Fix: added `file_write` to the content-writer persona; its persona/prompt tests pass, and the clean live run produced the file and checkpoint.
+2. **UI policy state, not a server bug.** The live window keeps its own local policy (`trusted`) and sends it with `SUBMIT_PROMPT`; changing the session through HTTP does not change that local control. The run row correctly stored `trusted`, and `shell_exec` still asked because it is outside the workspace path. Test procedure: set policy through the visible UI control (or `localStorage`) and verify the next run row.
 3. **P2 — shell execution refusals after approval.** The chat log showed `SHELL_EXEC REFUSED` for commands after the approval card; inspect tool results and shell policy rather than treating approval as execution success.
-4. **P2 — liveness watchdog seal failure.** `liveness-REPORT.json` has `ok:false` with `TimeoutError` after 185 records; the final health poll must be bounded and sealed as a completed observation, not a failed watchdog.
-5. **Harness gap — live UI specs.** `live-app.spec.ts` + `approval-flow.spec.ts` against the open app: **6 passed, 17 failed**; many failures are expected because the specs do not open the launcher URL with its launch token and some use fixture assumptions. Record as **test-harness mismatch**, not 17 product defects; run a launch-token-aware live suite next.
+4. **P2 — liveness watchdog seal failure.** `liveness-REPORT.json` has `ok:false` with `TimeoutError` after 185 records; the final health poll must be bounded and sealed as a completed observation, not a failed watchdog. Watchdog code now catches observation timeouts; rerun still needed.
+5. **P2 — UI checkpoint restore is disabled for a terminal run.** The live Data panel lists the checkpoint (`live-content-writer-proof.md`, seq 1) but says “This run is terminal (completed); its journal is read-only history.” The HTTP restore route works and was exercised in the auxiliary harness, but the live UI exposes no Restore button after completion. Decide whether restoring completed-run files is intended; if yes, enable it and test the confirm path in the live window.
+6. **Harness gap — live UI specs.** `live-app.spec.ts` + `approval-flow.spec.ts` against the open app: **6 passed, 17 failed**; many failures are expected because the specs do not open the launcher URL with its launch token and some use fixture assumptions. Record as **test-harness mismatch**, not 17 product defects; run a launch-token-aware live suite next.
 
 ## Four live watchdogs
 
