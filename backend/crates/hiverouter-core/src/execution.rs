@@ -54,6 +54,27 @@ fn default_now_unix_secs() -> u64 {
 /// the model; storing facts without this step is a no-op.
 /// A full-suite test run may verify a mutation. Compile-only, list-only, and
 /// filtered runs are intentionally excluded from verification credit.
+/// A task that attempted a mutating/executing tool but had every such attempt
+/// refused has not delivered an effect; it must fail, not complete as success.
+fn all_mutation_attempts_refused(transcript: &[ToolTurnTranscript]) -> bool {
+    let mut attempted = false;
+    let mut succeeded = false;
+    for turn in transcript {
+        for (plan, result) in &turn.results {
+            if matches!(
+                plan.tool.as_str(),
+                "file_write" | "apply_patch" | "run_tests" | "git_stage" | "git_commit" | "shell_exec"
+            ) {
+                attempted = true;
+                if result.outcome == hiverouter_contract::ToolOutcome::Ok {
+                    succeeded = true;
+                }
+            }
+        }
+    }
+    attempted && !succeeded
+}
+
 fn run_tests_is_full_suite(plan: &ToolCallPlan) -> bool {
     let Some(args) = plan.args.get("args").and_then(serde_json::Value::as_array) else {
         return true;
@@ -6492,6 +6513,13 @@ impl RunEngine {
                     );
                 }
             }
+            // No successful mutation after one or more refused mutation
+            // attempts: the seat is blocked, not complete. This catches the
+            // "requested hash could not be obtained" false-success shape.
+            if all_mutation_attempts_refused(&transcript) {
+                self.fail_task(run, task, AgentState::Failed)?;
+                return Ok(None);
+            }
             // A successful `finish` call is the model's explicit terminal
             // signal: its verdict becomes the final assistant message and the
             // task completes without another provider round-trip. A refused
@@ -6596,6 +6624,10 @@ impl RunEngine {
             final_reply = continuation;
         }
 
+        if all_mutation_attempts_refused(&transcript) {
+            self.fail_task(run, task, AgentState::Failed)?;
+            return Ok(None);
+        }
         match self.complete_task(run, task, &final_reply, true) {
             Ok(text) => Ok(text),
             Err(refusal) => {
