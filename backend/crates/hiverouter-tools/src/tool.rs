@@ -354,6 +354,10 @@ pub struct ReportResultArgs {
 pub struct FinishArgs {
     /// Final verdict text.
     pub verdict: String,
+    /// Set false when the objective is blocked or no deliverable was produced.
+    /// Omitted keeps the legacy success meaning.
+    #[serde(default)]
+    pub success: Option<bool>,
 }
 
 /// Arguments for `vote_evolution`.
@@ -700,7 +704,7 @@ impl ToolRegistry {
             ),
             contract(
                 ToolId::Finish,
-                "Finish the current task with a final verdict.",
+                "Finish the current task with a final verdict. Set success=false when the task is blocked or produced no deliverable; the engine then fails the seat instead of marking it complete.",
                 PermissionClass::Read,
                 schema_of!(FinishArgs),
             ),

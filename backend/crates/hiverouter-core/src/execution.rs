@@ -4014,6 +4014,15 @@ impl RunEngine {
                     .to_owned(),
             ));
         }
+        // A disabled side-effect plane must not create a card either.
+        if !tools.side_effects_enabled() {
+            return Ok(ToolExecution::refused(
+                plan.tool_call_id.clone(),
+                Refusal::ToolNotAllowed.code(),
+                "HIVEROUTER_SIDE_EFFECTS=0 disables granted side effects; no approval was created"
+                    .to_owned(),
+            ));
+        }
         // Preflight before creating the card: a command that the shell policy or
         // jail will refuse must never consume operator consent. checkpoint_restore
         // has its own bridge-side preflight and is excluded here.
@@ -4195,6 +4204,34 @@ impl RunEngine {
                     plan.tool, task.role
                 ),
             ));
+        }
+        if matches!(
+            plan.tool.as_str(),
+            "file_write" | "apply_patch" | "run_tests" | "git_stage" | "git_commit" | "shell_exec"
+        ) {
+            if let Err(refusal) = tools.preflight_model_tool_approval(
+                &self.tool_registry,
+                &self.shell_policy,
+                tier,
+                &plan.tool,
+                &plan.args,
+            ) {
+                hiverouter_tools::record_refusal(
+                    task.run_id,
+                    refusal,
+                    ToolId::from_id(&plan.tool),
+                    tool_loop::permission_for(&self.tool_registry, &plan.tool),
+                );
+                return Ok(ToolExecution::refused(
+                    plan.tool_call_id.clone(),
+                    refusal.code(),
+                    format!(
+                        "preflight refused {:?} before the policy grant: {}; no approval was created",
+                        plan.tool,
+                        refusal.message()
+                    ),
+                ));
+            }
         }
         let approval_id = tools.grant_policy_approval(
             run.id,
@@ -6553,6 +6590,16 @@ impl RunEngine {
                     .get("verdict")
                     .and_then(serde_json::Value::as_str)
                     .map_or_else(|| finish_result.text.clone(), str::to_owned);
+                let success = finish_plan
+                    .args
+                    .get("success")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                let blocked_verdict = verdict.to_ascii_uppercase().contains("BLOCKED");
+                if !success || blocked_verdict {
+                    self.fail_task(run, task, AgentState::Failed)?;
+                    return Ok(None);
+                }
                 let terminal = StreamedReply {
                     deltas: if verdict.is_empty() { Vec::new() } else { vec![verdict] },
                     // Keep measured usage for the REPLY_DONE event; the run
