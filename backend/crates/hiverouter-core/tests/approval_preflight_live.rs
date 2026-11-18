@@ -448,10 +448,13 @@ async fn disallowed_shell_commands_never_create_an_approval_card() {
 
     assert_eq!(
         collected.final_status.as_deref(),
-        Some("completed"),
-        "the run continues after a pre-refusal (a refusal is a tool result, not a run failure)"
+        Some("failed"),
+        "a run whose only mutation attempts were refused must fail, not report completed"
     );
-    assert_eq!(collected.terminal_error_code, None);
+    assert_eq!(
+        collected.terminal_error_code.as_deref(),
+        Some("E_TOOL_NOT_ALLOWED")
+    );
     assert_eq!(
         collected.codes,
         vec!["E_TOOL_NOT_ALLOWED".to_owned(), "E_TOOL_NOT_ALLOWED".to_owned()],

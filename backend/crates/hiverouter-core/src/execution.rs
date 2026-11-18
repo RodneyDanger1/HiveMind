@@ -65,9 +65,15 @@ fn all_mutation_attempts_refused(transcript: &[ToolTurnTranscript]) -> bool {
                 plan.tool.as_str(),
                 "file_write" | "apply_patch" | "run_tests" | "git_stage" | "git_commit" | "shell_exec"
             ) {
-                attempted = true;
                 if result.outcome == hiverouter_contract::ToolOutcome::Ok {
                     succeeded = true;
+                } else if result.outcome == hiverouter_contract::ToolOutcome::Refused
+                    && result.code.as_deref() == Some("E_TOOL_NOT_ALLOWED")
+                {
+                    // Only a policy/preflight refusal proves the mutation could
+                    // not be attempted. An operator deny is a valid tool result
+                    // that the model may explain and continue from.
+                    attempted = true;
                 }
             }
         }
@@ -2279,9 +2285,23 @@ impl RunEngine {
             // published the terminal frame; never duplicate it.
             (persisted, None)
         } else {
+            let any_task_failed = self
+                .store
+                .tasks_for_run(run.id)
+                .map(|tasks| tasks.iter().any(|task| task.state == AgentState::Failed))
+                .unwrap_or(false);
             let (status, error_code) = match &outcome {
+                // A run cannot be completed while one of its seats failed.
+                // The child's own named refusal is already recorded; the run
+                // carries the same named code so the UI cannot call it green.
+                Ok(()) if any_task_failed => (
+                    AgentState::Failed,
+                    Some(Refusal::ToolNotAllowed.code().to_owned()),
+                ),
                 Ok(()) => (AgentState::Completed, None),
-                Err(refusal) if *refusal == Refusal::ToolCancelled => (AgentState::Cancelled, None),
+                Err(refusal) if *refusal == Refusal::ToolCancelled => {
+                    (AgentState::Cancelled, None)
+                }
                 Err(refusal) => (AgentState::Failed, Some(refusal.code().to_owned())),
             };
             (status, error_code)
@@ -6516,7 +6536,7 @@ impl RunEngine {
             // No successful mutation after one or more refused mutation
             // attempts: the seat is blocked, not complete. This catches the
             // "requested hash could not be obtained" false-success shape.
-            if all_mutation_attempts_refused(&transcript) {
+            if self.tools.is_some() && all_mutation_attempts_refused(&transcript) {
                 self.fail_task(run, task, AgentState::Failed)?;
                 return Ok(None);
             }
@@ -6624,7 +6644,7 @@ impl RunEngine {
             final_reply = continuation;
         }
 
-        if all_mutation_attempts_refused(&transcript) {
+        if self.tools.is_some() && all_mutation_attempts_refused(&transcript) {
             self.fail_task(run, task, AgentState::Failed)?;
             return Ok(None);
         }
